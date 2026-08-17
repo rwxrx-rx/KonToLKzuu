@@ -29,6 +29,7 @@ on:
         required: true
         type: choice
         options:
+          - cristidclxvi
           - lineage
           - lotus-kernel
           - camellia
