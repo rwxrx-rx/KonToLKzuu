@@ -13,11 +13,12 @@ on:
           - 'kernel_only'
           - 'manager_only'
       ksu_fork:
-        description: 'Select KernelSU Fork'
+        description: 'Select KernelSU Fork / Type'
         required: true
         type: choice
         default: 'xxKSU'
         options:
+          - 'Vanilla'
           - 'xxKSU'
           - 'SUKISU'
           - 'ReSuKISU'
@@ -35,7 +36,7 @@ on:
           - vortex-v1
           - vortex-test
       include_susfs:
-        description: 'Include SUSFS (Kernel Anti-Detection)'
+        description: 'Include SUSFS (Kernel Anti-Detection) - Ignored if Vanilla'
         required: true
         type: boolean
         default: true
@@ -130,10 +131,9 @@ jobs:
   # -------------------------------------------------------------------------
   build-lpud-binary:
     needs: build-kernel-and-manager
-    if: inputs.include_lpud == true && (inputs.ksu_fork == 'xxKSU' || inputs.ksu_fork == 'SUKISU')
+    if: inputs.include_lpud == true && inputs.ksu_fork != 'Vanilla' && (inputs.ksu_fork == 'xxKSU' || inputs.ksu_fork == 'SUKISU')
     uses: ./.github/workflows/build-lpud.yml
     with:
       ksu_fork: ${{ inputs.ksu_fork }}
       target_arch: 'aarch64-linux-android'
     secrets: inherit
-    
