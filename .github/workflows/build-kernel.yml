@@ -110,12 +110,13 @@ jobs:
         run: bash .github/scripts/sync_source.sh "${{ inputs.manifest_name }}"
 
       - name: Setup KSU Fork
+        if: inputs.ksu_fork != 'Vanilla'
         uses: ./.github/actions/setup-ksu
         with:
           ksu_fork: ${{ inputs.ksu_fork }}
 
       - name: Apply SUSFS Patch & Configs
-        if: inputs.include_susfs == true
+        if: inputs.ksu_fork != 'Vanilla' && inputs.include_susfs == true
         uses: ./.github/actions/apply-susfs
 
       - name: Inject Selected Kernel Features
@@ -130,7 +131,7 @@ jobs:
           enable_bbr: ${{ inputs.include_bbr }}
           enable_ttl: ${{ inputs.include_ttl }}
           enable_droidspace: ${{ inputs.include_droidspace }}
-          enable_susfs: ${{ inputs.include_susfs }}
+          enable_susfs: ${{ inputs.ksu_fork != 'Vanilla' && inputs.include_susfs }}
 
       - name: Update Progress -> Compiling Kernel
         if: always()
@@ -148,7 +149,7 @@ jobs:
         uses: ./.github/actions/package-anykernel
         with:
           ksu_fork: ${{ inputs.ksu_fork }}
-          include_susfs: ${{ inputs.include_susfs }}
+          include_susfs: ${{ inputs.ksu_fork != 'Vanilla' && inputs.include_susfs }}
           include_bbg: ${{ inputs.include_bbg }}
           include_bbr: ${{ inputs.include_bbr }}
 
@@ -189,7 +190,7 @@ jobs:
   build-manager:
     needs: build-kernel
     if: |
-      always() && !cancelled() && (
+      always() && !cancelled() && inputs.ksu_fork != 'Vanilla' && (
         inputs.build_target == 'both' || inputs.build_target == 'manager_only'
       )
     runs-on: ubuntu-latest
@@ -222,9 +223,9 @@ jobs:
     needs: [build-kernel, build-manager]
     if: |
       always() && !cancelled() && (
-        (inputs.build_target == 'both' && needs.build-kernel.result == 'success' && needs.build-manager.result == 'success') ||
+        (inputs.build_target == 'both' && needs.build-kernel.result == 'success' && (inputs.ksu_fork == 'Vanilla' || needs.build-manager.result == 'success')) ||
         (inputs.build_target == 'kernel_only' && needs.build-kernel.result == 'success') ||
-        (inputs.build_target == 'manager_only' && needs.build-manager.result == 'success')
+        (inputs.build_target == 'manager_only' && inputs.ksu_fork != 'Vanilla' && needs.build-manager.result == 'success')
       )
     runs-on: ubuntu-latest
     permissions:
