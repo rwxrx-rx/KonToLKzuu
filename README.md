@@ -1,79 +1,68 @@
-<p align="center">
-  <img src="https://img.shields.io/badge/Kernel-4.14__Non--GKI-1e293b?style=for-the-badge&logo=linux&logoColor=white" />
-  <img src="https://img.shields.io/badge/Device-camellia%2Fn-38bdf8?style=for-the-badge&logo=android&logoColor=black" />
-  <img src="https://img.shields.io/badge/CI-GitHub_Actions-22c55e?style=for-the-badge&logo=githubactions&logoColor=white" />
-</p>
+# KonToLKzuu — Kernel & KSU Build Pipeline
 
-<h3 align="center">⚡ <code>KonToLKzuu</code> — Kernel & KSU Build Pipeline</h3>
+CI/CD pipeline for building 4.14 non-GKI Android kernels (device family: `camellia` / MT6833, e.g. POCO M3 Pro 5G / Redmi Note 10 5G), with optional ReSukiSU + SUSFS 2.2.0 integration, entirely on GitHub Actions.
 
-<p align="center">
-  <i>"It compiled on GitHub Actions, so it's feature-complete, not buggy... right?"</i> 💀
-</p>
+## What it builds
 
-<p align="center">
-  Personal CI/CD engine for compiling 4.14 non-GKI Linux kernels & KernelSU managers for <b>POCO M3 Pro 5G / Redmi Note 10 5G</b> (<code>camellia</code> / MT6833).
-</p>
+Each run can produce, in parallel:
 
----
+- **vanilla** — plain kernel, no root, no SUSFS.
+- **resukisu_susfs** — ReSukiSU (KernelSU fork) + SUSFS 2.2.0, built and hook-integrated into the kernel source at build time.
 
-## 📦 What This Repo Is
+Plus optional feature injectors applied to either variant: Baseband-Guard, WireGuard, F2FS backport, ZRAM/ZSTD, TCP BBR, TTL spoofing, ThinLTO/-O3.
 
-This is the **full source & build pipeline** behind **LotusKernel Camellia v7** — the kernel flashed via
-[the binary release](https://github.com/Sangmadun/KonToLKzuu/releases/tag/v20260818-1732).
-
-It contains everything needed to reproduce the build yourself on GitHub Actions:
+## Repo layout
 
 ```
 .github/
-├── workflows/          # Build kernel, userspace, manager, cleanup, upstream watcher
-├── actions/            # apply-susfs, inject-features, package-anykernel, setup-ksu,
-│                       # download-toolchain
-├── scripts/            # build_kernel.sh, ksud bootstrap, SUS_MAP 4.14, inline-hook validators, ...
-└── manifest/           # repo manifests (kernel base + revision pins)
+├── workflows/            # main.yml (entry point), build-kernel.yml (reusable), etc.
+├── actions/              # setup-ksu, apply-susfs, inject-features, package-anykernel, download-toolchain
+├── scripts/              # build_kernel.sh, hook injectors, contract validators, ksud bootstrap
+├── manifest/             # one repo manifest XML per supported kernel source
+└── hook-profiles.json    # manifest_name -> SUSFS hook profile mapping (see below)
 patches/
-├── camellia_v7_full_defconfig   # defconfig used for the v7 build
-├── camellia-anykernel/          # AnyKernel3 wrapper (flashable ZIP template)
-└── susfs_v220/                  # SUSFS 2.2.0 kernel tree for 4.14 (fs/ + security/ + kernel/)
+├── camellia_v7_full_defconfig
+├── camellia-anykernel/           # AnyKernel3 flashable ZIP template
+└── susfs_v220/profiles/<name>/tree/   # pre-merged SUSFS 2.2.0 source tree per hook profile
 ```
 
-## 🛠️ Features Built Into v7
+## How ReSukiSU + SUSFS integration works
 
-- 🛡️ **KernelSU fork:** ReSukiSU only (built-in ksud bootstrap, v4.2.0-rc1 / 35079) — this is the only fork this pipeline supports
-- 🔀 **Matrix build:** every run can build a plain **vanilla** kernel (no KSU/SUSFS) and a **ReSukiSU + SUSFS 2.2.0** kernel in parallel, or just one of the two
-- 🔒 **SUSFS 2.2.0** (ReSukiSU leg only) — SUS Path/Loop, SUS Map, SUS KSTAT, Open Redirect, uname/cmdline spoof, AVC log spoofing
-- 🧩 **DroidSpace & OverlayFS** (Mountify / Magic Mount) — ReSukiSU leg only
-- 📡 **Baseband-Guard (BBG)**
-- ⚡ **BBR** TCP congestion control, ZSTD/ZRAM, WireGuard, F2FS backport
-- 🌐 TTL/HL spoofing (mobile hotspot tethering bypass)
-- ⚙️ Proton-Clang / AOSP Clang toolchains, LTO + O3
+SUSFS on a legacy 4.14 kernel needs real source-level hook call-sites (not just a config flag), and those call-sites depend on the exact shape of the kernel source they're inserted into. This pipeline doesn't fuzzy-patch — it installs a pre-merged, known-good tree and validates it byte-for-byte.
 
-> The custom FT8722 FocalTech touch driver/panel patch has been removed. The
-> flyme base's own stock touchscreen driver is left untouched instead.
+Because of that, `resukisu_susfs` is only available for manifests that have a matching **hook profile** registered in `.github/hook-profiles.json`:
 
-## 🔧 Build It Yourself
+```json
+{
+  "camellia": "camellia-4.14",
+  "lineage-23.2": "camellia-4.14"
+}
+```
 
-1. **Fork** this repo.
-2. Open **Actions → "Build Kernel & Tools (Automated Pipeline)" → Run workflow**.
-3. Recommended inputs for a v7-equivalent build:
+- `manifest_name` not in this file → `build_variant=resukisu_susfs`/`both` is rejected immediately by `validate-inputs`, with the list of currently supported manifests.
+- Every hook injection / validation step is fail-closed and exact-match: if a manifest's source doesn't actually match its assigned profile, the build stops clearly at the "Apply SUSFS Patch & Configs" step — not with a confusing error deep inside kernel compilation.
 
-| Input | Value |
-|---|---|
-| `build_target` | `both` (kernel + manager) or `kernel_only` |
-| `build_variant` | `both` (matrix: vanilla + ReSukiSU/SUSFS), `vanilla`, or `resukisu_susfs` |
-| `manifest_name` | `camellia` |
-| `include_droidspace` | ✅ (default, ReSukiSU leg only) |
-| `include_bbg` | ✅ (default) |
+**Adding a new manifest:**
+- If it's a fork/branch of a kernel source already covered by an existing profile (same layout), just add `"<manifest_name>": "<existing-profile>"` to `hook-profiles.json`.
+- If it's a genuinely different kernel source/version, create `patches/susfs_v220/profiles/<new-profile>/tree/` with your own 3-way-merged SUSFS tree for that source, then register it the same way.
 
-4. Wait for the run to finish — artifacts (flashable AnyKernel3 ZIP(s) + Manager APK when the ReSukiSU leg runs) are uploaded to the run page / Releases. When `build_variant=both`, both a vanilla ZIP and a ReSukiSU+SUSFS ZIP are produced in the same run.
+## Toolchain note
 
-> The kernel source itself is **not vendored here** (keeps the repo small). It's pulled by the manifest:
-> `camellia-devs/kernel_xiaomi_mt6833` @ `56fa4c938c73d721341bba905790a46259192c60` (flyme branch).
-> See `.github/manifest/camellia.xml`.
+`toolchain=clang-22` pairs a modern LLVM/Clang with a very old (GCC 4.9-era) prebuilt binutils assembler used only for `CROSS_COMPILE`. `build_kernel.sh` forces `-fintegrated-as` so Clang assembles with its own backend instead of that ancient external `as`, avoiding assembler-syntax mismatches.
 
-## 🤝 Credits
+## Running a build
+
+1. Fork this repo.
+2. Actions → **Build Kernel & Tools (Automated Pipeline)** → Run workflow.
+3. Pick `build_target`, `build_variant`, `manifest_name`, toolchain, and feature toggles.
+4. Artifacts (flashable AnyKernel3 ZIP(s), Manager APK for the ReSukiSU leg) are uploaded to the run and to Releases.
+
+The kernel source itself is not vendored here — it's pulled per-manifest via `.github/manifest/<name>.xml`.
+
+## Credits
 
 [`camellia-devs`](https://github.com/camellia-devs/kernel_xiaomi_mt6833) • [`LinuxxPU`](https://github.com/ahmad24shargh/LinuxxPU) • [`GKI_KernelSU_SUSFS`](https://github.com/WildKernels/GKI_KernelSU_SUSFS) • [`TheWildJames`](https://github.com/TheWildJames) • [`SUKISU`](https://github.com/ShirkNeko) • [`xxKSU`](https://github.com/backslashxx) • [`KernelSU`](https://github.com/tiann/KernelSU) • [`ReSukiSU`](https://github.com/ReSukiSU/ReSukiSU) • [`AnyKernel3`](https://github.com/osm0sis/AnyKernel3) • [`Baseband-guard`](https://github.com/vc-teahouse/Baseband-guard)
 
 ---
 
-> ⚠️ Flashing a custom kernel carries risk (bootloop / data loss). Always keep a backup and a way to flash back to stock. This project is provided as-is; use at your own risk.
+⚠️ Flashing a custom kernel carries risk (bootloop / data loss). Keep a backup and a way back to stock. Provided as-is, use at your own risk.
