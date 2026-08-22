@@ -34,7 +34,7 @@ on:
           - lotus-test
           - vortex-v1
           - vortex-test
-          - cristidclxvi
+          - lineage-23.2
       include_droidspace:
         description: 'Enable DroidSpace & OverlayFS (Mountify / Magic Mount) — applies only to the resukisu_susfs leg'
         required: true
