@@ -2,7 +2,7 @@
 <manifest>
   <remote name="github" fetch="https://github.com" />
 
-  <default revision="flyme" remote="github" sync-j="4" />
+  <default revision="lineage-23.2" remote="github" sync-j="4" />
 
   <project path="kernel-source" name="rwxrx-rx/android_kernel_xiaomi_camellia" revision="lineage-23.2" />
 </manifest>
