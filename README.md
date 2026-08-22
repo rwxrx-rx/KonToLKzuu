@@ -70,13 +70,6 @@ patches/
 > `camellia-devs/kernel_xiaomi_mt6833` @ `56fa4c938c73d721341bba905790a46259192c60` (flyme branch).
 > See `.github/manifest/camellia.xml`.
 
-## 📥 Prebuilt Binaries
-
-| Release | Contents |
-|---|---|
-| [v20260818-1732](https://github.com/Sangmadun/KonToLKzuu/releases/tag/v20260818-1732) | LotusKernel v7 final ZIP + SHA256 + ReSukiSU Manager APK + cert |
-| [v7-camellia-universal](https://github.com/Sangmadun/KonToLKzuu/releases/tag/v7-camellia-universal) | Earlier universal build |
-
 ## 🤝 Credits
 
 [`camellia-devs`](https://github.com/camellia-devs/kernel_xiaomi_mt6833) • [`LinuxxPU`](https://github.com/ahmad24shargh/LinuxxPU) • [`GKI_KernelSU_SUSFS`](https://github.com/WildKernels/GKI_KernelSU_SUSFS) • [`TheWildJames`](https://github.com/TheWildJames) • [`SUKISU`](https://github.com/ShirkNeko) • [`xxKSU`](https://github.com/backslashxx) • [`KernelSU`](https://github.com/tiann/KernelSU) • [`ReSukiSU`](https://github.com/ReSukiSU/ReSukiSU) • [`AnyKernel3`](https://github.com/osm0sis/AnyKernel3) • [`Baseband-guard`](https://github.com/vc-teahouse/Baseband-guard)
