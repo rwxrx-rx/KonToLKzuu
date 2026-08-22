@@ -2,8 +2,8 @@
 <manifest>
   <remote name="github" fetch="https://github.com" />
 
-  <default revision="flyme" remote="github" sync-j="4" />
+  <default revision="lineage-23.2" remote="github" sync-j="4" />
 
   <!-- Pinned to the exact Flyme source audited by SUS_MAP/Inline injectors. -->
-  <project path="kernel-source" name="camellia-devs/kernel_xiaomi_mt6833" revision="56fa4c938c73d721341bba905790a46259192c60" />
+  <project path="kernel-source" name="rwxrx-rx/android_kernel_xiaomi_camellia" revision="56fa4c938c73d721341bba905790a46259192c60" />
 </manifest>
