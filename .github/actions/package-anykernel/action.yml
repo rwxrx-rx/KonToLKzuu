@@ -1,0 +1,262 @@
+name: "Package AnyKernel3"
+description: "Package built kernel into AnyKernel3 zip archive and generate SHA256 checksum"
+inputs:
+  ksu_fork:
+    description: "KernelSU engine used"
+    required: false
+    default: ""
+  include_susfs:
+    description: "Include SuSFS flag"
+    required: false
+    default: "false"
+  include_bbg:
+    description: "Include BBG flag"
+    required: false
+    default: "false"
+  include_bbr:
+    description: "Include BBR flag"
+    required: false
+    default: "false"
+  resukisu_bootstrap:
+    description: "Bundle and stage official ReSukiSU userspace payload"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Package AnyKernel3 & Generate SHA256
+      shell: bash
+      run: |
+        if [ ! -d "AnyKernel3" ]; then
+          echo "📥 Cloning AnyKernel3 repository..."
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+        fi
+
+        cd AnyKernel3
+
+        # Use the tested Camellia recovery backend. Unlike the generic
+        # AnyKernel backend, it resolves bootdevice/by-name and falls back
+        # to the platform by-name directory used by OrangeFox/TWRP.
+        cp -f ../patches/camellia-anykernel/update-binary META-INF/com/google/android/update-binary
+        cp -f ../patches/camellia-anykernel/ak3-core.sh tools/ak3-core.sh
+        chmod 0755 META-INF/com/google/android/update-binary
+        chmod 0755 tools/ak3-core.sh
+        sha256sum META-INF/com/google/android/update-binary tools/ak3-core.sh
+
+        # -----------------------------------------------------------------
+        # PENANGANAN KERNEL IMAGE
+        # -----------------------------------------------------------------
+        OUT_DIR="../kernel-source/out/arch/arm64/boot"
+
+        if [ -f "${OUT_DIR}/Image.gz-dtb" ]; then
+          echo "✅ Found Image.gz-dtb! Copying to AnyKernel3..."
+          cp "${OUT_DIR}/Image.gz-dtb" .
+        elif [ -f "${OUT_DIR}/Image.gz" ]; then
+          echo "✅ Found Image.gz! Copying to AnyKernel3..."
+          cp "${OUT_DIR}/Image.gz" .
+        elif [ -f "${OUT_DIR}/Image" ]; then
+          echo "✅ Found Image! Copying to AnyKernel3..."
+          cp "${OUT_DIR}/Image" .
+        else
+          echo "❌ Error: No valid kernel image found in ${OUT_DIR}!"
+          exit 1
+        fi
+
+        # -----------------------------------------------------------------
+        # ReSukiSU userspace bootstrap
+        #
+        # A legacy 4.14 kernel has no pre-existing su/ksud installation.
+        # The official Manager normally installs its embedded libksud.so via
+        # a root shell, which creates a bootstrap deadlock on a fresh boot.
+        # Carry the exact official arm64 userspace binary in the ZIP and let
+        # the recovery-side installer seed /data/adb before first boot.
+        # This is not an APK replacement and does not create a fake su.
+        # -----------------------------------------------------------------
+        if [ "${{ inputs.resukisu_bootstrap }}" = "true" ]; then
+        OFFICIAL_APK=$(find ../output_apk -maxdepth 1 -type f -name '*.apk' | head -n 1 || true)
+        [ -n "$OFFICIAL_APK" ] || { echo "❌ Official Manager APK missing for ksud bootstrap"; exit 1; }
+        mkdir -p resukisu-bootstrap
+        unzip -p "$OFFICIAL_APK" lib/arm64-v8a/libksud.so > resukisu-bootstrap/ksud.susmap
+        unzip -p "$OFFICIAL_APK" lib/arm64-v8a/libadbroot.so > resukisu-bootstrap/libadbroot.so
+        test -s resukisu-bootstrap/ksud.susmap || { echo "❌ libksud.so missing from official APK"; exit 1; }
+        test -s resukisu-bootstrap/libadbroot.so || { echo "❌ libadbroot.so missing from official APK"; exit 1; }
+        cp "$GITHUB_WORKSPACE/.github/scripts/ksud_bootstrap_install.sh" resukisu-bootstrap/ksud
+        chmod 0755 resukisu-bootstrap/ksud resukisu-bootstrap/ksud.susmap resukisu-bootstrap/libadbroot.so
+        bash -n resukisu-bootstrap/ksud
+        sha256sum resukisu-bootstrap/ksud.susmap > resukisu-bootstrap/ksud.sha256
+        test "$(awk 'NR==1 {print $1}' resukisu-bootstrap/ksud.sha256)" = \
+          "$(sha256sum resukisu-bootstrap/ksud.susmap | awk '{print $1}')"
+        file resukisu-bootstrap/ksud.susmap resukisu-bootstrap/libadbroot.so
+        sha256sum resukisu-bootstrap/ksud resukisu-bootstrap/ksud.susmap resukisu-bootstrap/libadbroot.so
+
+        # Bundle the official OverlayFS metamodule as a separate, retryable
+        # userspace payload. It is installed only by Android init after ksud
+        # succeeds; recovery never executes it.
+        META_URL="https://github.com/KernelSU-Modules-Repo/meta-overlayfs/releases/download/v1.3.1/meta-overlayfs-13100-1.3.1.zip"
+        curl --fail --location --retry 3 --connect-timeout 15 --max-time 120 "$META_URL" \
+          -o resukisu-bootstrap/meta-overlayfs-13100-1.3.1.zip
+        unzip -t resukisu-bootstrap/meta-overlayfs-13100-1.3.1.zip >/dev/null
+        unzip -p resukisu-bootstrap/meta-overlayfs-13100-1.3.1.zip module.prop | grep -q '^metamodule=1$'
+        sha256sum resukisu-bootstrap/meta-overlayfs-13100-1.3.1.zip
+        cp "$GITHUB_WORKSPACE/.github/scripts/ksud_bootstrap_meta.sh" resukisu-bootstrap/bootstrap-meta.sh
+        chmod 0755 resukisu-bootstrap/bootstrap-meta.sh
+        bash -n resukisu-bootstrap/bootstrap-meta.sh
+        echo "✅ official meta-overlayfs payload verified"
+        fi
+
+        [ -f "${OUT_DIR}/dtb" ] && cp "${OUT_DIR}/dtb" .
+        [ -f "${OUT_DIR}/dtbo.img" ] && cp "${OUT_DIR}/dtbo.img" .
+
+        # -----------------------------------------------------------------
+        # TAGGING & NAMING SETUP
+        # -----------------------------------------------------------------
+        KSU_NAME="${{ inputs.ksu_fork }}"
+        [ -z "$KSU_NAME" ] && KSU_NAME="NoKSU"
+
+        FEATURE_TAGS=""
+        [ "${{ inputs.include_susfs }}" = "true" ] && FEATURE_TAGS="${FEATURE_TAGS}-SUSFS"
+        [ "${{ inputs.include_bbg }}" = "true" ] && FEATURE_TAGS="${FEATURE_TAGS}-BBG"
+        [ "${{ inputs.include_bbr }}" = "true" ] && FEATURE_TAGS="${FEATURE_TAGS}-BBR"
+
+        # -----------------------------------------------------------------
+        # GENERATE ANYKERNEL.SH
+        # -----------------------------------------------------------------
+        cat << 'EOF_AK3' > anykernel.sh
+        # AnyKernel3 Ramdisk Mod Script for Xiaomi Camellia (MT6833)
+        # osm0sis @ xda-developers
+
+        ## AnyKernel setup
+        properties() { '
+        kernel.string=Lotus Kernel for Xiaomi Camellia
+        do.devicecheck=1
+        do.modules=0
+        do.systemless=1
+        do.cleanup=1
+        do.cleanuponabort=0
+        device.name1=camellia
+        device.name2=camellian
+        supported.versions=
+        supported.patchlevels=
+        '; } # end properties
+
+        ## AnyKernel install
+        boot_attributes() {
+        set_perm_recursive 0 0 755 644 $RAMDISK/*;
+        set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
+        } # end attributes
+
+        # boot shell variables
+        # Match the known-working Flyme Camellia package exactly.
+        block=boot;
+        is_slot_device=auto;
+        no_block_display=1;
+        ramdisk_compression=auto;
+        patch_vbmeta_flag=auto;
+
+        # Import fungsi utama AnyKernel
+        . tools/ak3-core.sh;
+
+        # Fix O3BFD File Descriptor
+        if [ -z "$O3BFD" ] || [ ! -e "/proc/self/fd/$O3BFD" ]; then
+          for fd in 1 2 3 0; do
+            if [ -e "/proc/self/fd/$fd" ]; then
+              O3BFD=$fd;
+              break;
+            fi;
+          done;
+        fi;
+
+        # Print Full Cyber ASCII Banner
+        ui_print "==================================================";
+        ui_print " #    ####  ##### #   #  ###   ### #  ####  #   # ";
+        ui_print " #   #    #   #   #   # #     #    # #     # #  # ";
+        ui_print " #   #    #   #   #   #  ###  #    ##      #  # # ";
+        ui_print " #   #    #   #   #   #     # #    # #     #   ## ";
+        ui_print " ###  ####    #    ###  ####   ### #  #### #    # ";
+        ui_print "==================================================";
+        ui_print "               LOTUS-KERNEL CUSTOM                ";
+        ui_print "==================================================";
+        ui_print " [>] Device   : Xiaomi Camellia (Redmi Note 10 5G)";
+        ui_print " [>] Kernel   : Linux 4.14.x";
+        ui_print "==================================================";
+
+        sleep 2;
+
+        # Seed official ReSukiSU userspace while recovery still has root.
+        # ksud install extracts its embedded assets and creates the runtime
+        # layout/symlinks used by the kernel init hook.
+        install_resukisu_userspace() {
+          local adb=/data/adb;
+          local bootstrap="$adb/ksu-bootstrap";
+          mkdir -p "$bootstrap" || abort "Cannot create /data/adb bootstrap directory";
+          local staged="$bootstrap/.staged-35079";
+          rm -rf "$staged";
+          mkdir -p "$staged" || abort "Cannot create userspace staging directory";
+          unzip -p "$ZIPFILE" resukisu-bootstrap/ksud > "$staged/ksud" || abort "Cannot extract ksud launcher";
+          unzip -p "$ZIPFILE" resukisu-bootstrap/ksud.susmap > "$staged/ksud.susmap" || abort "Cannot extract official ksud";
+          unzip -p "$ZIPFILE" resukisu-bootstrap/ksud.sha256 > "$staged/ksud.sha256" || abort "Cannot extract ksud digest";
+          unzip -p "$ZIPFILE" resukisu-bootstrap/libadbroot.so > "$staged/libadbroot.so" || abort "Cannot extract libadbroot";
+          unzip -p "$ZIPFILE" resukisu-bootstrap/meta-overlayfs-13100-1.3.1.zip > "$staged/meta-overlayfs-13100-1.3.1.zip" || abort "Cannot extract meta-overlayfs";
+          unzip -p "$ZIPFILE" resukisu-bootstrap/bootstrap-meta.sh > "$staged/bootstrap-meta.sh" || abort "Cannot extract metamodule bootstrap";
+          chmod 0755 "$staged/ksud" "$staged/ksud.susmap" "$staged/libadbroot.so" "$staged/bootstrap-meta.sh";
+          local expected actual;
+          expected=$(awk 'NR==1 {print $1}' "$staged/ksud.sha256") || abort "Cannot read ksud digest";
+          actual=$(sha256sum "$staged/ksud.susmap" | awk '{print $1}') || abort "Cannot hash official ksud";
+          [ "${#expected}" -eq 64 ] && [ "$actual" = "$expected" ] || abort "Official ksud digest mismatch";
+          for item in ksud ksud.susmap ksud.sha256 libadbroot.so meta-overlayfs-13100-1.3.1.zip bootstrap-meta.sh; do
+            mv -f "$staged/$item" "$bootstrap/$item" || abort "Cannot activate staged userspace: $item";
+          done;
+          rmdir "$staged" 2>/dev/null || true;
+          # Do not execute ksud or the metamodule from recovery. Both require
+          # Android userspace, mount namespaces, and SELinux policy.
+          [ -x "$bootstrap/ksud" ] || abort "ksud launcher missing after extraction";
+          [ -x "$bootstrap/ksud.susmap" ] || abort "official ksud missing after extraction";
+          [ -x "$bootstrap/bootstrap-meta.sh" ] || abort "metamodule bootstrap missing after extraction";
+          [ -s "$bootstrap/meta-overlayfs-13100-1.3.1.zip" ] || abort "meta-overlayfs payload missing after extraction";
+          ui_print " [✓] ReSukiSU and meta-overlayfs payloads staged; Android init will install them";
+        }
+        if [ "${{ inputs.resukisu_bootstrap }}" = "true" ]; then
+          install_resukisu_userspace;
+        fi
+
+        # Never write boot until the required first-boot userspace payload has
+        # been staged and hash-validated successfully.
+        split_boot;
+        flash_boot;
+        flash_dtbo;
+        EOF_AK3
+
+        # -----------------------------------------------------------------
+        # BUILD ZIP & SHA256 DI ROOT WORKSPACE (..)
+        # -----------------------------------------------------------------
+        ZIP_NAME="LotusKernel-Camellia-${KSU_NAME}${FEATURE_TAGS}-$(date +%Y%m%d_%H%M).zip"
+        
+        echo "📦 Creating ZIP archive: ${ZIP_NAME}"
+        zip -r9 "../${ZIP_NAME}" * -x .git README.md *placeholder
+
+        cd ..
+        sha256sum "${ZIP_NAME}" > "${ZIP_NAME}.sha256"
+        echo "✅ Created SHA256 checksum: ${ZIP_NAME}.sha256"
+
+        # -----------------------------------------------------------------
+        # GENERATE CHANGELOG & COMMIT LINK (PERBAIKAN DENGAN FALLBACK)
+        # -----------------------------------------------------------------
+        if [ -d "kernel-source" ]; then
+          cd kernel-source
+          git log -n 10 --pretty=format:"• %h - %s (%cr) <%an>" > ../changelog.txt 2>/dev/null || echo "• Lotus Kernel Build Release" > ../changelog.txt
+          
+          REMOTE_URL=$(git config --get remote.origin.url 2>/dev/null | sed 's/\.git$//' || true)
+          HEAD_SHA=$(git rev-parse HEAD 2>/dev/null || true)
+
+          if [ -n "$REMOTE_URL" ] && [ -n "$HEAD_SHA" ]; then
+            echo "${REMOTE_URL}/commit/${HEAD_SHA}" > ../commit_link.txt
+          else
+            echo "https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}" > ../commit_link.txt
+          fi
+          cd ..
+        else
+          echo "• Lotus Kernel Build Release" > changelog.txt
+          echo "https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}" > commit_link.txt
+        fi
+        echo "✅ Generated changelog.txt & commit_link.txt!"

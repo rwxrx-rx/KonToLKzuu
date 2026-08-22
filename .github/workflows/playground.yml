@@ -1,0 +1,80 @@
+name: Playground & Debug Tool
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_target:
+        description: 'Pilih fungsi yang ingin diuji'
+        required: true
+        default: 'telegram_bot_test'
+        type: choice
+        options:
+          - telegram_bot_test
+          - random_package_id_gen
+
+jobs:
+  playground:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # =========================================================================
+      # TEST 1: Pengujian Bot Telegram (Kirim Pesan & Dummy File)
+      # =========================================================================
+      - name: Test Telegram Bot
+        if: inputs.test_target == 'telegram_bot_test'
+        run: |
+          TOKEN="${{ secrets.TELEGRAM_TOKEN }}"
+          CHAT_ID="${{ secrets.TELEGRAM_CHAT_ID }}"
+
+          if [ -z "$TOKEN" ] || [ -z "$CHAT_ID" ]; then
+            echo "❌ Error: TELEGRAM_TOKEN atau TELEGRAM_CHAT_ID belum dimasukkan di GitHub Secrets!"
+            exit 1
+          fi
+
+          echo "1. Mengetes Pengiriman Pesan Teks..."
+          curl -s -X POST "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+            -d "chat_id=${CHAT_ID}" \
+            -d "parse_mode=Markdown" \
+            -d "text=🧪 *Tes Bot Telegram Berhasil!*%0A%0AConnection ke GitHub Actions lancar jaya. Siap digunakan untuk build kernel!"
+
+          echo -e "\n2. Mengetes Pengiriman File Simulasi..."
+          echo "Ini adalah file dummy untuk tes pengiriman bot telegram." > dummy_build.zip
+          
+          curl -s -F chat_id="${CHAT_ID}" \
+               -F document=@"dummy_build.zip" \
+               -F caption="📦 *Tes Upload File Dummy Berhasil!*" \
+               -F parse_mode="Markdown" \
+               "https://api.telegram.org/bot${TOKEN}/sendDocument"
+          
+          echo -e "\n✅ Pengujian Bot Selesai!"
+
+      # =========================================================================
+      # TEST 2: Generator Random Package ID (Obfuscation)
+      # =========================================================================
+      - name: Generate Random Package ID
+        if: inputs.test_target == 'random_package_id_gen'
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y wamerican uni2ascii
+          dic=$(mktemp)
+          subdict=$(mktemp)
+          uni2ascii -B /usr/share/dict/american-english > $dic
+
+          rand=$(awk -v min=1 -v max="$(wc -l < $dic)" 'BEGIN{srand(); print int(min+rand()*(max-min+1))}')
+          app_label=$(awk "NR==${rand} {print}" $dic)
+
+          sed -E -n '/^.{3}$/p' $dic > $subdict
+          rand=$(awk -v min=1 -v max="$(wc -l < $subdict)" 'BEGIN{srand(); print int(min+rand()*(max-min+1))}')
+          p_id_1=$(awk "NR==${rand} {print}" $subdict)
+
+          sed -E -n '/^.{5}$/p' $dic > $subdict
+          rand=$(awk -v min=1 -v max="$(wc -l < $subdict)" 'BEGIN{srand(); print int(min+rand()*(max-min+1))}')
+          p_id_2=$(awk "NR==${rand} {print}" $subdict)
+
+          sed -E -n '/^.{7}$/p' $dic > $subdict
+          rand=$(awk -v min=1 -v max="$(wc -l < $subdict)" 'BEGIN{srand(); print int(min+rand()*(max-min+1))}')
+          p_id_3=$(awk "NR==${rand} {print}" $subdict)
+
+          echo "Generated App Label : $app_label"
+          echo "Generated Package ID: ${p_id_1}.${p_id_2}.${p_id_3}"

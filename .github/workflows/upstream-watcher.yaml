@@ -1,0 +1,147 @@
+name: Flexible Upstream Dependency Watcher
+
+on:
+  schedule:
+    # Berjalan otomatis setiap hari pukul 00:00 UTC (07:00 WIB)
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Memungkinkan pemicuan manual via GitHub Web UI
+
+permissions:
+  contents: write # Diperlukan untuk melakukan commit file JSON kembali ke repo
+
+jobs:
+  check-all-upstreams:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Check All Upstream Repositories
+        env:
+          TELEGRAM_TOKEN: "${{ secrets.TELEGRAM_TOKEN }}"
+          TELEGRAM_CHAT_ID: "${{ secrets.TELEGRAM_CHAT_ID }}"
+          REPO_NAME: "${{ github.repository }}"
+        run: |
+          python3 << 'EOF'
+          import os, json, subprocess, urllib.request, urllib.parse
+
+          token = os.environ.get("TELEGRAM_TOKEN")
+          chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+          my_repo = os.environ.get("REPO_NAME", "")
+          state_file = "upstream_hashes.json"
+
+          # 🎯 DAFTAR REPOSITORI YANG DIPANTAU (hanya ReSukiSU, satu-satunya
+          # fork KernelSU yang dipakai pipeline ini)
+          TARGETS = [
+              {
+                  "name": "ReSuKISU",
+                  "url": "https://github.com/ReSukiSU/ReSukiSU.git",
+                  "branch": "main",
+                  "key": "resukisu"
+              },
+              {
+                  "name": "Baseband-Guard",
+                  "url": "https://github.com/vc-teahouse/Baseband-guard.git",
+                  "branch": "main",
+                  "key": "baseband_guard"
+              }
+          ]
+
+          # Baca status hash sebelumnya dari file JSON
+          hashes = {}
+          if os.path.exists(state_file):
+              try:
+                  with open(state_file, "r") as f:
+                      hashes = json.load(f)
+              except Exception:
+                  hashes = {}
+
+          for target in TARGETS:
+              name = target["name"]
+              url = target["url"]
+              branch = target["branch"]
+              key = target["key"]
+
+              print(f"\n🔍 Checking {name} ({url})...")
+
+              try:
+                  git_cmd = f"git ls-remote {url} refs/heads/{branch}"
+                  output = subprocess.check_output(git_cmd, shell=True).decode().strip()
+                  if not output:
+                      # Fallback jika branch utama adalah master
+                      git_cmd = f"git ls-remote {url} refs/heads/master"
+                      output = subprocess.check_output(git_cmd, shell=True).decode().strip()
+                      if not output:
+                          continue
+                  latest_hash = output.split()[0]
+              except Exception as e:
+                  print(f"⚠️ Failed to fetch {name}:", e)
+                  continue
+
+              prev_hash = hashes.get(key, "")
+              short_hash = latest_hash[:7]
+
+              print(f"Current Remote Hash : {latest_hash}")
+              print(f"Previous Stored Hash: {prev_hash}")
+
+              if latest_hash != prev_hash:
+                  print(f"🚀 New update found for {name}!")
+                  hashes[key] = latest_hash
+
+                  # Kirim Notifikasi Telegram (Menggunakan HTML Parse Mode agar aman dari error parse)
+                  if token and chat_id:
+                      clean_url = url.replace(".git", "")
+                      commit_url = f"{clean_url}/commit/{latest_hash}"
+                      action_url = f"https://github.com/{my_repo}/actions/workflows/build-kernel.yaml"
+
+                      text = (
+                          f"🔔 <b>New Upstream Update Detected!</b>\n\n"
+                          f"📦 <b>Project:</b> <code>{name}</code>\n"
+                          f"🔑 <b>Commit:</b> <a href='{commit_url}'>{short_hash}</a>\n\n"
+                          f"💡 <i>Click buttons below to check commit or start building.</i>"
+                      )
+
+                      reply_markup = {
+                          "inline_keyboard": [
+                              [
+                                  {"text": "📜 View Commit", "url": commit_url},
+                                  {"text": "🚀 Run Build Now", "url": action_url}
+                              ]
+                          ]
+                      }
+
+                      data = urllib.parse.urlencode({
+                          "chat_id": chat_id,
+                          "text": text,
+                          "parse_mode": "HTML",
+                          "reply_markup": json.dumps(reply_markup),
+                          "disable_web_page_preview": "true"
+                      }).encode()
+
+                      req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+                      try:
+                          urllib.request.urlopen(req)
+                          print(f"✅ Telegram alert sent for {name}.")
+                      except Exception as e:
+                          print("❌ Telegram error:", e)
+              else:
+                  print(f"✅ {name} is up to date.")
+
+          # Simpan status hash terbaru ke file JSON
+          with open(state_file, "w") as f:
+              json.dump(hashes, f, indent=2)
+          EOF
+
+      - name: Commit & Push Updated Hashes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add upstream_hashes.json
+          if git diff --staged --quiet; then
+            echo "No hash changes to commit."
+          else
+            git commit -m "chore: update upstream commit hashes [skip ci]"
+            git push
+          fi
+          

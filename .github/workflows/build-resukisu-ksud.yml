@@ -1,0 +1,69 @@
+name: Acquire Official ReSukiSU 35079 SUS_MAP Userspace
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  RESUKISU_COMMIT: cdce8bb8c8bf2167d21751e39ca6cdc4ad154678
+  RESUKISU_VERSION: "35079"
+  RESUKISU_REV_COUNT: "4379"
+  OFFICIAL_APK_URL: https://github.com/Sangmadun/KonToLKzuu/releases/download/resukisu-35079-official/ReSukiSU_v4.2.0-rc1_35079-arm64-v8a-release.apk
+  OFFICIAL_APK_SHA256: 1304702a9aac86d6354ace9798eec0b1efb1b50ed6a1a8309e54680b39be0d6b
+  OFFICIAL_KSUD_SHA256: c70756391ff6994ccc7b8d85ac43459cf9d087f90d22c52c50bfa3c2be3b2a3a
+
+jobs:
+  acquire-userspace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout pipeline
+        uses: actions/checkout@v4
+
+      - name: Verify official full-history 35079 source contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/ReSukiSU/ReSukiSU.git resukisu
+          git -C resukisu checkout --detach "$RESUKISU_COMMIT"
+          test "$(git -C resukisu rev-parse --is-shallow-repository)" = false
+          test "$(git -C resukisu rev-parse HEAD)" = "$RESUKISU_COMMIT"
+          test "$(git -C resukisu rev-list --count HEAD)" = "$RESUKISU_REV_COUNT"
+          test "$((30000 + RESUKISU_REV_COUNT + 700))" = "$RESUKISU_VERSION"
+          grep -Fq 'CMD_SUSFS_ADD_SUS_MAP' resukisu/userspace/ksud/src/android/susfs/api/features/sus_map.rs
+          grep -Fq 'add_sus_map' resukisu/userspace/ksud/src/android/susfs/cli.rs
+          grep -Fq 'KERNEL_SU_UAPI_VERSION = 2' resukisu/uapi/supercall.h
+
+      - name: Acquire byte-identical official Manager and embedded ksud
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 \
+            "$OFFICIAL_APK_URL" -o ReSukiSU-35079-official.apk
+          echo "$OFFICIAL_APK_SHA256  ReSukiSU-35079-official.apk" | sha256sum -c -
+          unzip -p ReSukiSU-35079-official.apk lib/arm64-v8a/libksud.so > ksud
+          chmod 0755 ksud
+          echo "$OFFICIAL_KSUD_SHA256  ksud" | sha256sum -c -
+          file ksud | grep -q 'ELF 64-bit LSB.*ARM aarch64'
+          readelf -h ksud | grep -q 'Machine:.*AArch64'
+          readelf -l ksud | grep -q '/system/bin/linker64'
+          strings -a ksud > ksud.strings
+          grep -Fq '4.2.0-rc1-18-gcdce8bb8 (uapi: 2)' ksud.strings
+          grep -Fq 'add_sus_map' ksud.strings
+          grep -Fq 'enabled_features' ksud.strings
+          grep -aob '35079' ksud >/dev/null
+          sha256sum ksud > ksud.sha256
+
+      - name: Upload verified official ReSukiSU 35079 userspace
+        uses: actions/upload-artifact@v4
+        with:
+          name: resukisu-ksud-official-35079-susmap-arm64
+          path: |
+            ksud
+            ksud.sha256
+            ReSukiSU-35079-official.apk
+          if-no-files-found: error
+          retention-days: 7

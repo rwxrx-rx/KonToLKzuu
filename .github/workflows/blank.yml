@@ -1,0 +1,131 @@
+name: Build Vanilla Kernel 4.14
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: 'Target Defconfig File Name (contoh: camellia_defconfig)'
+        required: true
+        default: 'camellian_gl_defconfig'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Send Telegram Build Started
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            🚀 **BUILD KERNEL DIMULAI!**
+            🔹 Repository: ${{ github.repository }}
+            🔹 Run Number: ${{ github.run_number }}
+            🔹 Defconfig: ${{ inputs.defconfig }}
+            Mohon tunggu, proses kompilasi sedang berjalan...
+
+      - name: Setup Environment & Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses-dev bison flex libssl-dev bc git wget curl zip dos2unix
+
+      - name: Clone Kernel Source
+        run: |
+          # Ganti URL di bawah dengan link source kernel 4.14 Anda
+          git clone --depth=1 https://github.com/cristidclxvi/android_kernel_xiaomi_camellia.git -b lineage-23.2 kernel-source
+
+      - name: Download Proton-Clang Toolchain
+        run: |
+          mkdir -p toolchain/clang
+          cd toolchain/clang
+          echo "Downloading Proton-Clang..."
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang.git .
+
+      - name: Setup GCC Toolchain (Fallback 32-bit/64-bit)
+        run: |
+          cd toolchain
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git gcc64
+          git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git gcc32
+
+      - name: Compile Vanilla Kernel
+        run: |
+          cd kernel-source
+          
+          export KBUILD_BUILD_USER="VanillaBuilder"
+          export KBUILD_BUILD_HOST="GitHubActions"
+          
+          export PATH="$GITHUB_WORKSPACE/toolchain/clang/bin:$GITHUB_WORKSPACE/toolchain/gcc64/bin:$GITHUB_WORKSPACE/toolchain/gcc32/bin:$PATH"
+          
+          make O=out ARCH=arm64 ${{ inputs.defconfig }}
+          make -j$(nproc --all) O=out \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi-
+
+      - name: Package Kernel (AnyKernel3)
+        run: |
+          git clone https://github.com/Kernel-SU/AnyKernel3 -b master anykernel
+          rm -rf anykernel/.git anykernel/README.md
+          
+          if [ -f "kernel-source/out/arch/arm64/boot/Image.gz-dtb" ]; then
+            cp kernel-source/out/arch/arm64/boot/Image.gz-dtb anykernel/
+          elif [ -f "kernel-source/out/arch/arm64/boot/Image.gz" ]; then
+            cp kernel-source/out/arch/arm64/boot/Image.gz anykernel/
+          else
+            cp kernel-source/out/arch/arm64/boot/Image anykernel/
+          fi
+          
+          cd anykernel
+          zip -r9 ../Vanilla-Kernel-4.14-Camellia.zip *
+
+      - name: Generate Changelog
+        id: changelog
+        run: |
+          echo "GENERATED_CHANGELOG<<EOF" >> $GITHUB_ENV
+          echo "🔹 **Vanilla Kernel Build (No Root / No SuSFS)**" >> $GITHUB_ENV
+          echo "🔹 **Kernel Version:** 4.14.357" >> $GITHUB_ENV
+          echo "🔹 **Toolchain:** Proton-Clang" >> $GITHUB_ENV
+          echo "🔹 **Latest Commits:**" >> $GITHUB_ENV
+          cd kernel-source && git log -5 --pretty=format:"- %s (%an)" >> ../changelog.txt
+          cat ../changelog.txt >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Create GitHub Release & Upload Asset
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v4.14-vanilla-${{ github.run_number }}
+          name: "Vanilla Kernel 4.14.357 Build #${{ github.run_number }}"
+          body: ${{ env.GENERATED_CHANGELOG }}
+          files: Vanilla-Kernel-4.14-Camellia.zip
+
+      - name: Send Telegram Build Success
+        if: success()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          document: "Vanilla-Kernel-4.14-Camellia.zip"
+          caption: |
+            ✅ **BUILD KERNEL BERHASIL!**
+            
+            ${{ env.GENERATED_CHANGELOG }}
+            
+            🔗 [Download from GitHub Release](${{ steps.create_release.outputs.url }})
+
+      - name: Send Telegram Build Failed
+        if: failure()
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: |
+            ❌ **BUILD KERNEL GAGAL!**
+            Terjadi kesalahan saat proses kompilasi. Silakan cek log GitHub Actions untuk detailnya.

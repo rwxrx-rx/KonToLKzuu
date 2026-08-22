@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <remote name="github" fetch="https://github.com" />
+  <project path="kernel-source" name="rwxrx-rx/android_kernel_xiaomi_camellia" remote="github" revision="vortex-v1" />
+</manifest>
+

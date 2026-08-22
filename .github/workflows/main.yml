@@ -1,0 +1,138 @@
+name: Build Kernel & Tools (Automated Pipeline)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_target:
+        description: 'Select Build Target'
+        required: true
+        type: choice
+        default: 'both'
+        options:
+          - 'both'
+          - 'kernel_only'
+          - 'manager_only'
+          - 'userspace_only'
+      build_variant:
+        description: 'Select Build Variant (matrix: both runs vanilla + ReSukiSU/SUSFS in parallel)'
+        required: true
+        type: choice
+        default: 'both'
+        options:
+          - 'both'
+          - 'vanilla'
+          - 'resukisu_susfs'
+      manifest_name:
+        description: 'Select Manifest XML Device'
+        required: true
+        type: choice
+        default: 'camellia'
+        options:
+          - lineage
+          - lotus-kernel
+          - camellia
+          - lotus-test
+          - vortex-v1
+          - vortex-test
+          - cristidclxvi
+      include_droidspace:
+        description: 'Enable DroidSpace & OverlayFS (Mountify / Magic Mount) — applies only to the resukisu_susfs leg'
+        required: true
+        type: boolean
+        default: true
+      include_bbg:
+        description: 'Include Baseband-Guard (BBG)'
+        required: true
+        type: boolean
+        default: true
+      toolchain:
+        description: 'Select Clang Toolchain'
+        required: true
+        type: choice
+        default: 'clang-22'
+        options:
+          - 'proton-clang'
+          - 'clang-22'
+          - 'aosp-clang'
+          - 'zyc-clang'
+          - 'azure-clang'
+          - 'eva-gcc'
+
+      # =========================================================================
+      # INDIVIDUAL KERNEL-SIDE FEATURE TOGGLES (apply to every variant built)
+      # =========================================================================
+      include_lto_o3:
+        description: 'Enable ThinLTO & -O3 Compiler Optimizations'
+        required: true
+        type: boolean
+        default: true
+      include_wireguard:
+        description: 'Inject WireGuard VPN Protocol'
+        required: true
+        type: boolean
+        default: true
+      include_f2fs:
+        description: 'Inject F2FS Backport for 4.14'
+        required: true
+        type: boolean
+        default: true
+      include_zstd:
+        description: 'Enable ZRAM ZSTD Compression'
+        required: true
+        type: boolean
+        default: true
+      include_bbr:
+        description: 'Enable TCP BBR & Westwood Congestion Control'
+        required: true
+        type: boolean
+        default: true
+      include_ttl:
+        description: 'Enable TTL / HL Packet Spoofing'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Fail fast on nonsensical combinations before spending any runner time.
+  # -------------------------------------------------------------------------
+  validate-inputs:
+    if: inputs.build_target != 'userspace_only'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject manager_only + vanilla-only
+        if: inputs.build_target == 'manager_only' && inputs.build_variant == 'vanilla'
+        run: |
+          echo "::error::build_target=manager_only has nothing to build when build_variant=vanilla (the Manager APK is the ReSukiSU/SUSFS artifact; vanilla never produces one)"
+          exit 1
+
+  # -------------------------------------------------------------------------
+  # JOB 1: AUTOMATICALLY CALL WORKER KERNEL & MANAGER (matrix: vanilla / resukisu_susfs)
+  # -------------------------------------------------------------------------
+  build-kernel-and-manager:
+    needs: validate-inputs
+    if: inputs.build_target != 'userspace_only'
+    uses: ./.github/workflows/build-kernel.yml
+    with:
+      build_target: ${{ inputs.build_target }}
+      build_variant: ${{ inputs.build_variant }}
+      manifest_name: ${{ inputs.manifest_name }}
+      include_droidspace: ${{ inputs.include_droidspace }}
+      include_bbg: ${{ inputs.include_bbg }}
+      toolchain: ${{ inputs.toolchain }}
+      include_lto_o3: ${{ inputs.include_lto_o3 }}
+      include_wireguard: ${{ inputs.include_wireguard }}
+      include_f2fs: ${{ inputs.include_f2fs }}
+      include_zstd: ${{ inputs.include_zstd }}
+      include_bbr: ${{ inputs.include_bbr }}
+      include_ttl: ${{ inputs.include_ttl }}
+    secrets: inherit
+
+  # Build only the exact pinned SUS_MAP-capable ReSukiSU daemon. This path
+  # cannot invoke the kernel or manager reusable workflows.
+  build-resukisu-userspace:
+    if: inputs.build_target == 'userspace_only'
+    uses: ./.github/workflows/build-resukisu-ksud.yml

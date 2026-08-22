@@ -1,0 +1,634 @@
+name: Build Kernel & Manager Worker
+
+on:
+  workflow_call:
+    inputs:
+      build_target:
+        required: true
+        type: string
+      build_variant:
+        description: "'both' | 'vanilla' | 'resukisu_susfs' — drives the build matrix"
+        required: true
+        type: string
+      manifest_name:
+        required: true
+        type: string
+      include_droidspace:
+        required: false
+        type: boolean
+        default: true
+      include_bbg:
+        required: true
+        type: boolean
+      toolchain:
+        required: true
+        type: string
+      include_lto_o3:
+        required: false
+        type: boolean
+      include_wireguard:
+        required: false
+        type: boolean
+      include_f2fs:
+        required: false
+        type: boolean
+      include_zstd:
+        required: false
+        type: boolean
+      include_bbr:
+        required: false
+        type: boolean
+      include_ttl:
+        required: false
+        type: boolean
+    secrets:
+      TELEGRAM_TOKEN:
+        required: false
+      TELEGRAM_CHAT_ID:
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+
+# =========================================================================
+# JOB 1: BUILD & COMPILING KERNEL
+# =========================================================================
+  build-kernel:
+    needs: build-manager
+    if: "always() && !cancelled() && inputs.build_target != 'manager_only'"
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      # build_variant 'both' expands to both matrix legs running in parallel;
+      # 'vanilla' or 'resukisu_susfs' runs only that single leg.
+      matrix:
+        variant: ${{ fromJSON(inputs.build_variant == 'both' && '["vanilla","resukisu_susfs"]' || format('["{0}"]', inputs.build_variant)) }}
+
+    env:
+      ARCH: "arm64"
+      KERNEL_DEFCONFIG: ${{ inputs.manifest_name == 'cristidclxvi' && 'camellian_id_defconfig' || 'camellia_defconfig' }}
+      IS_RESUKISU: ${{ matrix.variant == 'resukisu_susfs' }}
+
+    steps:
+      - name: Require successful Manager build for the ReSukiSU leg
+        if: matrix.variant == 'resukisu_susfs' && inputs.build_target == 'both' && needs.build-manager.result != 'success'
+        run: |
+          echo "::error::ReSukiSU+SUSFS variant requires a successful Manager build (build_target=both)"
+          exit 1
+
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          swap-size-mb: 8192
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Require exact Manager pair for ReSukiSU kernel builds
+        if: matrix.variant == 'resukisu_susfs' && inputs.build_target == 'kernel_only'
+        shell: bash
+        run: |
+          echo "::error::ReSukiSU Camellia builds require build_target=both so the exact official Manager artifact is paired before compilation"
+          exit 1
+
+      - name: Download Official ReSukiSU APK for Kernel Signature Pairing
+        if: matrix.variant == 'resukisu_susfs' && inputs.build_target == 'both'
+        uses: actions/download-artifact@v4
+        with:
+          name: manager-apk-artifact
+          path: output_apk
+
+      - name: Select Defconfig per Manifest
+        run: |
+          echo "Manifest=${{ inputs.manifest_name }} -> Active defconfig: ${KERNEL_DEFCONFIG}"
+
+      - name: Send Telegram Start Notification
+        env:
+          TELEGRAM_TOKEN: "${{ secrets.TELEGRAM_TOKEN }}"
+          TELEGRAM_CHAT_ID: "${{ secrets.TELEGRAM_CHAT_ID }}"
+          MANIFEST: "${{ inputs.manifest_name }}"
+          TARGET: "${{ inputs.build_target }}"
+          KSU: "${{ matrix.variant == 'resukisu_susfs' && 'ReSuKISU' || 'vanilla' }}"
+          TOOLCHAIN: "${{ inputs.toolchain }}"
+          RUN_NUM: "${{ github.run_number }}"
+        run: python3 .github/scripts/telegram_notify.py start
+
+      - name: Setup Build Dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          export NEEDRESTART_MODE=a
+          # Hosted-runner mirrors can occasionally take more than three minutes.
+          # Do not purge filesystem paths as package names; install only the
+          # build dependencies with apt's own retry/lock handling.
+          timeout 600s sudo -n apt-get update -qq \
+            -o Acquire::Retries=5 \
+            -o Acquire::http::Timeout=60 \
+            -o Acquire::https::Timeout=60
+          timeout 600s sudo -n apt-get install -y \
+            -o DPkg::Lock::Timeout=120 \
+            -o Acquire::Retries=5 \
+            build-essential bc libncurses5-dev libssl-dev bison flex libelf-dev \
+            zip unzip git ccache curl aria2 jq
+          echo '✅ Build dependencies installed'
+          command -v timeout >/dev/null
+          command -v make >/dev/null
+          command -v unzip >/dev/null
+          command -v jq >/dev/null
+          echo '✅ Dependency command gate passed'
+
+
+      - name: Download Toolchains
+        uses: ./.github/actions/download-toolchain
+        with:
+          toolchain: ${{ inputs.toolchain }}
+
+      - name: Sync Kernel Source from Manifest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/sync_source.sh "${{ inputs.manifest_name }}"
+
+      - name: Patch Defconfig for cristidclxvi Source
+        if: inputs.manifest_name == 'cristidclxvi'
+        run: |
+          DC="kernel-source/arch/arm64/configs/camellian_id_defconfig"
+          if [ -f "$DC" ]; then
+            # MILLET points at vendor/xiaomi/kernel_modules/mihw/millet/ which Xiaomi never published.
+            # Author's own camellian_gl_defconfig disables it; do the same for the ID variant.
+            sed -i 's|^CONFIG_MILLET=y$|# CONFIG_MILLET is not set|' "$DC"
+            echo "=== MILLET/MIHW state after patch ==="
+            grep -nE 'MILLET|MIHW' "$DC" || true
+
+            # camellian.dts includes Xiaomi-proprietary <camellian/cust.dtsi> (never published),
+            # so building mediatek/camellian.dtb fails. The author's own camellian_gl_defconfig
+            # disables APPENDED_DTB and boots with the stock/prebuilt dtb. Mirror that:
+            # build a plain Image.gz and skip the DTB build entirely.
+            sed -i 's|^CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE=y$|# CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE is not set|' "$DC"
+            sed -i '/^CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE_NAMES=/d' "$DC"
+            echo "=== APPENDED_DTB state after patch ==="
+            grep -nE 'APPENDED_DTB' "$DC" || true
+
+            # ReSukiSU selinux_hide.c falls back to extern references of static selinuxfs
+            # symbols (sel_handle_status_ops, write_op) when CONFIG_KALLSYMS_ALL is off,
+            # which breaks final link on 4.14. Enable KALLSYMS_ALL so KSU uses its runtime
+            # kallsyms lookup path. Also un-static the two symbols as belt-and-braces.
+            if ! grep -q '^CONFIG_KALLSYMS_ALL=y' "$DC"; then
+              echo 'CONFIG_KALLSYMS_ALL=y' >> "$DC"
+            fi
+            echo "=== KALLSYMS state after patch ==="
+            grep -nE 'KALLSYMS' "$DC" || true
+
+            sed -i 's/^static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/' kernel-source/security/selinux/selinuxfs.c
+            sed -i 's/^static ssize_t (\*write_op\[\])/ssize_t (*write_op[])/' kernel-source/security/selinux/selinuxfs.c
+            echo "=== selinuxfs symbol visibility after patch ==="
+            grep -n 'sel_handle_status_ops =\|write_op\[\]' kernel-source/security/selinux/selinuxfs.c || true
+          else
+            echo "::error::Defconfig $DC not found"
+            exit 1
+          fi
+
+      - name: Patch Defconfig (flyme/camellia manifest)
+        if: inputs.manifest_name == 'camellia'
+        run: |
+          DC="kernel-source/arch/arm64/configs/camellia_defconfig"
+          FULL="$GITHUB_WORKSPACE/patches/camellia_v7_full_defconfig"
+          echo "=== [defconfig] replacing minimal camellia_defconfig with FULL flyme config ==="
+          # The in-tree camellia_defconfig is a MINIMAL fragment and is missing core
+          # Android options (DEVTMPFS, SYSVIPC, TMPFS_XATTR, NF_TABLES, ...) that the
+          # real flyme build shipped. Building from it => non-booting kernel. So use
+          # the full config extracted from the known-good flyme boot image (stock
+          # touchscreen driver only — the FT8722 patch/panel is not carried, per
+          # request). SUS_MAP is enabled later only after its exact legacy-4.14
+          # source port is installed.
+          if [ -f "$FULL" ]; then
+            cp -f "$FULL" "$DC"
+            echo "[defconfig] installed full config ($(wc -l < "$DC") lines)"
+          else
+            echo "::error::full defconfig payload missing at $FULL"; exit 1
+          fi
+          echo "=== sanity: core Android options present ==="
+          for c in CONFIG_DEVTMPFS CONFIG_SYSVIPC CONFIG_TMPFS_XATTR CONFIG_NF_TABLES CONFIG_MTK_COMBO_WIFI CONFIG_MTK_COMBO_BT; do
+            grep -qE "^$c=y" "$DC" && echo "  ok $c" || { echo "::error::$c missing in defconfig"; exit 1; }
+          done
+          echo "  SUS_MAP final state is enforced after feature injection"
+
+      - name: Setup KSU Fork
+        if: matrix.variant == 'resukisu_susfs'
+        uses: ./.github/actions/setup-ksu
+
+      - name: Apply SUSFS Patch & Configs
+        if: matrix.variant == 'resukisu_susfs'
+        uses: ./.github/actions/apply-susfs
+        with:
+          resukisu_legacy_hooks: ${{ inputs.manifest_name == 'camellia' && matrix.variant == 'resukisu_susfs' }}
+
+      - name: Configure ReSukiSU SUSFS Inline Hooks (legacy 4.14)
+        if: inputs.manifest_name == 'camellia' && matrix.variant == 'resukisu_susfs'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DC="kernel-source/arch/arm64/configs/camellia_defconfig"
+          # Inline mode is finalized after the SUSFS tree is installed below.
+          sed -i '/^CONFIG_KSU_MANUAL_HOOK=/d; /^# CONFIG_KSU_MANUAL_HOOK is not set$/d' "$DC"
+          echo '# CONFIG_KSU_MANUAL_HOOK is not set' >> "$DC"
+          sed -i '/^CONFIG_KSU_SUSFS=/d; /^# CONFIG_KSU_SUSFS is not set$/d' "$DC"
+          echo 'CONFIG_KSU_SUSFS=y' >> "$DC"
+          sed -i 's/^CONFIG_KSU_TRACEPOINT_HOOK=y$/# CONFIG_KSU_TRACEPOINT_HOOK is not set/' "$DC"
+          sed -i 's/^CONFIG_KPROBES=y$/# CONFIG_KPROBES is not set/' "$DC"
+          sed -i 's/^CONFIG_KPROBE_EVENTS=y$/# CONFIG_KPROBE_EVENTS is not set/' "$DC"
+          ! grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' "$DC"
+          grep -q '^CONFIG_KSU_SUSFS=y$' "$DC"
+          ! grep -q '^CONFIG_KSU_TRACEPOINT_HOOK=y$' "$DC"
+          echo '✅ ReSukiSU SUSFS inline hooks selected'
+
+      - name: Inject Selected Kernel Features
+        uses: ./.github/actions/inject-features
+        with:
+          defconfig: ${{ env.KERNEL_DEFCONFIG }}
+          enable_bbg: ${{ inputs.include_bbg }}
+          enable_lto_o3: ${{ inputs.include_lto_o3 }}
+          enable_wireguard: ${{ inputs.include_wireguard }}
+          enable_f2fs: ${{ inputs.include_f2fs }}
+          enable_zstd: ${{ inputs.include_zstd }}
+          enable_bbr: ${{ inputs.include_bbr }}
+          enable_ttl: ${{ inputs.include_ttl }}
+          enable_droidspace: ${{ matrix.variant == 'resukisu_susfs' && inputs.include_droidspace }}
+          enable_susfs: ${{ matrix.variant == 'resukisu_susfs' }}
+
+      - name: Finalize ReSukiSU Inline Hook Config
+        if: inputs.manifest_name == 'camellia' && matrix.variant == 'resukisu_susfs'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DC="kernel-source/arch/arm64/configs/camellia_defconfig"
+          sed -i '/^CONFIG_KSU_MANUAL_HOOK=/d' "$DC"
+          sed -i '/^# CONFIG_KSU_MANUAL_HOOK is not set$/d' "$DC"
+          echo '# CONFIG_KSU_MANUAL_HOOK is not set' >> "$DC"
+          sed -i '/^CONFIG_KSU_SUSFS=/d' "$DC"
+          echo 'CONFIG_KSU_SUSFS=y' >> "$DC"
+          sed -i 's/^CONFIG_KSU_TRACEPOINT_HOOK=y$/# CONFIG_KSU_TRACEPOINT_HOOK is not set/' "$DC"
+          sed -i 's/^CONFIG_KPROBES=y$/# CONFIG_KPROBES is not set/' "$DC"
+          sed -i 's/^CONFIG_KPROBE_EVENTS=y$/# CONFIG_KPROBE_EVENTS is not set/' "$DC"
+          grep -q '^# CONFIG_KSU_MANUAL_HOOK is not set$' "$DC"
+          grep -q '^CONFIG_KSU_SUSFS=y$' "$DC"
+          ! grep -q '^CONFIG_KSU_TRACEPOINT_HOOK=y$' "$DC"
+          echo '✅ final SUSFS inline-hook config enforced after all feature injectors'
+
+      - name: Update Progress -> Compiling Kernel
+        if: always()
+        env:
+          TELEGRAM_TOKEN: "${{ secrets.TELEGRAM_TOKEN }}"
+          TELEGRAM_CHAT_ID: "${{ secrets.TELEGRAM_CHAT_ID }}"
+          MANIFEST_NAME: "${{ inputs.manifest_name }}"
+          KSU_FORK: "${{ matrix.variant == 'resukisu_susfs' && 'ReSuKISU' || 'vanilla' }}"
+        run: python3 .github/scripts/telegram_notify.py progress
+
+      - name: Pair Manager Certificate After All Kernel Injections
+        if: inputs.manifest_name == 'camellia' && matrix.variant == 'resukisu_susfs'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$GITHUB_WORKSPACE/output_apk/ReSukiSU_v4.2.0-rc1_35079-arm64-v8a-official.apk"
+          SRC="$GITHUB_WORKSPACE/kernel-source"
+          SIGN_H="$SRC/drivers/kernelsu/manager/manager_sign.h"
+          SIGN_C="$SRC/drivers/kernelsu/manager/apk_sign.c"
+          [ -f "$APK" ] && [ -f "$SIGN_H" ] && [ -f "$SIGN_C" ]
+          read -r CERT_SIZE CERT_HASH < <(python3 "$GITHUB_WORKSPACE/.github/scripts/extract_apk_v2_cert.py" "$APK")
+          test "$CERT_SIZE" = 887
+          test "$CERT_HASH" = d3469712b6214462764a1d8d3e5cbe1d6819a0b629791b9f4101867821f1df64
+          python3 - "$SIGN_H" "$CERT_SIZE" "$CERT_HASH" <<'PY'
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          size, digest = sys.argv[2], sys.argv[3]
+          lines = p.read_text().splitlines()
+          found_size = found_hash = False
+          out = []
+          for line in lines:
+              if line.startswith('#define EXPECTED_SIZE_RESUKISU '):
+                  line = f'#define EXPECTED_SIZE_RESUKISU {size}'
+                  found_size = True
+              elif line.startswith('#define EXPECTED_HASH_RESUKISU '):
+                  line = f'#define EXPECTED_HASH_RESUKISU "{digest}"'
+                  found_hash = True
+              out.append(line)
+          if not (found_size and found_hash):
+              raise SystemExit(f'manager signature macros missing: size={found_size} hash={found_hash}')
+          p.write_text('\n'.join(out) + '\n')
+          PY
+          grep -q "#define EXPECTED_SIZE_RESUKISU $CERT_SIZE" "$SIGN_H"
+          grep -q "#define EXPECTED_HASH_RESUKISU \"$CERT_HASH\"" "$SIGN_H"
+          grep -q 'EXPECTED_HASH_RESUKISU' "$SIGN_C"
+          if ! grep -q 'ksu_compat_cert_marker' "$SIGN_C"; then
+            printf '\n/* Keep the paired Manager certificate in the final boot image. */\n__attribute__((used, section(".rodata"))) static const char ksu_compat_cert_marker[] = EXPECTED_HASH_RESUKISU;\n' >> "$SIGN_C"
+          fi
+          grep -q 'ksu_compat_cert_marker' "$SIGN_C"
+          echo "✅ final pre-build Manager pairing: size=$CERT_SIZE sha256=$CERT_HASH"
+
+      - name: Build Kernel Image
+        env:
+          REQUIRE_CLANG_22: ${{ inputs.manifest_name == 'camellia' && matrix.variant == 'resukisu_susfs' && '1' || '0' }}
+          KSU_ENABLED: ${{ matrix.variant == 'resukisu_susfs' && '1' || '0' }}
+        run: bash .github/scripts/build_kernel.sh "${{ env.KERNEL_DEFCONFIG }}" "${{ env.ARCH }}"
+
+      - name: Reject non-pinned compiler for Camellia release
+        if: inputs.manifest_name == 'camellia' && matrix.variant == 'resukisu_susfs' && inputs.toolchain != 'clang-22'
+        run: |
+          echo "::error::Camellia ReSukiSU release requires LLVM/Clang 22.1.0 (toolchain=clang-22)"
+          exit 1
+
+      - name: Verify ReSukiSU/SUSFS kernel contract
+        if: inputs.manifest_name == 'camellia' && matrix.variant == 'resukisu_susfs'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$GITHUB_WORKSPACE/kernel-source"
+          DC="$SRC/out/.config"
+          IMG="$SRC/out/arch/arm64/boot/Image.gz-dtb"
+          [ -f "$DC" ] || { echo "::error::final .config missing"; exit 1; }
+          [ -f "$IMG" ] || { echo "::error::Image.gz-dtb missing"; exit 1; }
+          for c in CONFIG_KSU CONFIG_KSU_MULTI_MANAGER_SUPPORT CONFIG_KSU_SUSFS; do
+            grep -qE "^${c}=y$" "$DC" || { echo "::error::$c is not enabled in final .config"; exit 1; }
+          done
+          grep -q '^CONFIG_KSU_SUSFS=y$' "$DC" || { echo "::error::SUSFS inline hook config is not enabled"; exit 1; }
+          ! grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' "$DC" || { echo "::error::manual hook remains enabled"; exit 1; }
+          # Official ReSukiSU Manager 4.2 build 35079 requires matching ABI.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check_abi_version.py" "$SRC/out/vmlinux" "$IMG"
+          ! grep -q '^CONFIG_KSU_TRACEPOINT_HOOK=y$' "$DC" || { echo "::error::tracepoint hook must be disabled"; exit 1; }
+          ! grep -q '^CONFIG_KPROBES=y$' "$DC" || { echo "::error::Kprobes runtime must be disabled for pure inline mode"; exit 1; }
+          grep -q '^CONFIG_HAVE_KPROBES=y$' "$DC" || { echo "::error::ARM64 Kprobes capability was incorrectly removed"; exit 1; }
+          grep -q '^choice$' "$SRC/drivers/kernelsu/Kconfig" || { echo "::error::upstream hook choice was rewritten"; exit 1; }
+          grep -q '^#elif defined(CONFIG_KSU_SUSFS)$' "$SRC/drivers/kernelsu/runtime/ksud_integration.c" || { echo "::error::pure SUSFS runtime branch missing"; exit 1; }
+          test -f "$SRC/drivers/kernelsu/tools/inline_hook_check.mk" || { echo "::error::inline hook checker missing"; exit 1; }
+          grep -q 'using SuSFS Inline hook' "$SRC/drivers/kernelsu/Kbuild" || { echo "::error::Kbuild inline path missing"; exit 1; }
+          grep -q 'include.*inline_hook_check.mk' "$SRC/drivers/kernelsu/Kbuild" || { echo "::error::inline hook checker not selected"; exit 1; }
+          for pair in \
+            'kernel/sys.c:(void)ksu_handle_setuid(new->uid.val, old->uid.val)' \
+            'fs/stat.c:ksu_handle_stat(&dfd' \
+            'fs/exec.c:ksu_handle_execveat(' \
+            'fs/open.c:ksu_handle_faccessat(&dfd' \
+            'fs/read_write.c:ksu_handle_sys_read(fd' \
+            'kernel/reboot.c:ksu_handle_sys_reboot(magic1' \
+            'drivers/input/input.c:ksu_handle_input_handle_event(&type'; do
+            f="${pair%%:*}"; call="${pair#*:}"
+            # Require more than an extern declaration: at least two matches
+            # means declaration + real call in the compiled source file.
+            test "$(grep -F -c "$call" "$SRC/$f")" -ge 1 || { echo "::error::inline call missing in $f: $call"; exit 1; }
+            ! grep -q 'CONFIG_KSU_MANUAL_HOOK' "$SRC/$f" || { echo "::error::manual guard found in $f"; exit 1; }
+          done
+          test "$(grep -F -c 'ksu_handle_execveat(' "$SRC/fs/exec.c")" -ge 5 || { echo "::error::native/compat exec hooks incomplete"; exit 1; }
+          ! grep -q 'ksu_handle_newfstat_ret' "$SRC/fs/stat.c" || { echo "::error::manual-only newfstat hook leaked into inline build"; exit 1; }
+          echo "✅ ReSukiSU SUSFS inline-hook path and all call-sites present"
+          for c in CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT CONFIG_KSU_SUSFS_SPOOF_UNAME CONFIG_KSU_SUSFS_ENABLE_LOG CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG CONFIG_KSU_SUSFS_OPEN_REDIRECT; do
+            grep -q "^$c=y$" "$DC" || { echo "::error::$c missing from final config"; exit 1; }
+          done
+          for stale in CONFIG_KSU_SUSFS_SUS_OVERLAYFS CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT CONFIG_KSU_SUSFS_TRY_UMOUNT CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT; do
+            ! grep -q "^$stale=" "$DC" || { echo "::error::orphan SUSFS config leaked: $stale"; exit 1; }
+          done
+          grep -q '^CONFIG_KSU_SUSFS_SUS_MAP=y$' "$DC" || { echo "::error::SUS_MAP missing from final config"; exit 1; }
+          TM="$SRC/fs/proc/task_mmu.c"
+          BASE="$SRC/fs/proc/base.c"
+          grep -q 'SUSMAP_414_PORT_V2' "$TM" || { echo "::error::SUS_MAP 4.14 V2 port marker missing"; exit 1; }
+          test "$(sha256sum "$TM" | cut -d' ' -f1)" = 40651c75e81f9ba5ebc8c4bbcadb83ec5cdc19bf9094324508f14110d9ebe558 || { echo "::error::SUS_MAP task_mmu exact digest mismatch"; exit 1; }
+          test "$(grep -F -c 'SUSFS_IS_INODE_SUS_MAP' "$TM")" -eq 4 || { echo "::error::maps/smaps/rollup/pagemap SUS_MAP hook count invalid"; exit 1; }
+          grep -q 'hidden but iterator cache stays coherent' "$TM" || { echo "::error::smaps iterator-cache preservation missing"; exit 1; }
+          grep -q 'pm.buffer\[susmap_idx\]\.pme = 0' "$TM" || { echo "::error::pagemap positional zeroing missing"; exit 1; }
+          grep -q 'first_visible_start' "$TM" || { echo "::error::smaps_rollup visible boundary tracking missing"; exit 1; }
+          test "$(grep -F -c 'SUSFS_IS_INODE_SUS_MAP' "$BASE")" -eq 5 || { echo "::error::map_files lookup/count/fill/revalidate/readlink SUS_MAP hooks incomplete"; exit 1; }
+          grep -q '^#define CMD_SUSFS_ADD_SUS_MAP 0x60020$' "$SRC/include/linux/susfs_def.h" || { echo "::error::SUS_MAP command ABI mismatch"; exit 1; }
+          ! test -e "$SRC/drivers/kernelsu/include/linux/susfs_def.h" || { echo "::error::shadow SUSFS ABI header exists"; exit 1; }
+          grep -q 'case CMD_SUSFS_ADD_SUS_MAP' "$SRC/drivers/kernelsu/supercall/dispatch.c" || { echo "::error::SUS_MAP supercall dispatch missing"; exit 1; }
+          grep -q 'susfs_add_sus_map(arg)' "$SRC/drivers/kernelsu/supercall/dispatch.c" || { echo "::error::SUS_MAP supercall handler missing"; exit 1; }
+          grep -q 'set_bit(AS_FLAGS_SUS_MAP' "$SRC/fs/susfs.c" || { echo "::error::SUS_MAP inode registration missing"; exit 1; }
+          grep -Fq 'copy_config_to_buf("CONFIG_KSU_SUSFS_SUS_MAP' "$SRC/fs/susfs.c" || { echo "::error::SUS_MAP missing from enabled_features response"; exit 1; }
+          grep -q 'char[[:space:]]*target_pathname\[SUSFS_MAX_LEN_PATHNAME\]' "$SRC/include/linux/susfs.h" || { echo "::error::SUS_MAP kernel struct path layout mismatch"; exit 1; }
+          grep -q 'int[[:space:]]*err;' "$SRC/include/linux/susfs.h" || { echo "::error::SUS_MAP kernel struct error field missing"; exit 1; }
+          echo "✅ SUS_MAP source + command ABI + procfs interfaces are fail-closed"
+          grep -q 'SUSFS_VERSION.*2\.2\.0' "$SRC/include/linux/susfs.h" || { echo "::error::SUSFS 2.2.0 header not found"; exit 1; }
+          grep -q 'EXPECTED_HASH_RESUKISU' "$SRC/drivers/kernelsu/manager/manager_sign.h" || { echo "::error::ReSukiSU signature table missing"; exit 1; }
+          OFFICIAL_APK="$GITHUB_WORKSPACE/output_apk/ReSukiSU_v4.2.0-rc1_35079-arm64-v8a-official.apk"
+          test "$(sha256sum "$OFFICIAL_APK" | awk '{print $1}')" = 1304702a9aac86d6354ace9798eec0b1efb1b50ed6a1a8309e54680b39be0d6b
+          read -r OFFICIAL_SIZE OFFICIAL_HASH < <(python3 "$GITHUB_WORKSPACE/.github/scripts/extract_apk_v2_cert.py" "$OFFICIAL_APK")
+          test "$OFFICIAL_SIZE" = 887
+          test "$OFFICIAL_HASH" = d3469712b6214462764a1d8d3e5cbe1d6819a0b629791b9f4101867821f1df64
+          grep -q "$OFFICIAL_HASH" "$SRC/drivers/kernelsu/manager/manager_sign.h" || { echo "::error::official Manager hash missing from manager_sign.h"; exit 1; }
+          grep -q 'EXPECTED_HASH_RESUKISU' "$SRC/drivers/kernelsu/manager/apk_sign.c" || { echo "::error::ReSukiSU signature key missing from apk_sign.c"; exit 1; }
+          grep -q "$OFFICIAL_HASH" "$SRC/out/vmlinux" || { echo "::error::official Manager hash missing from final vmlinux"; exit 1; }
+          python3 "$GITHUB_WORKSPACE/.github/scripts/check_image_hash.py" "$IMG" "$OFFICIAL_HASH"
+          echo "✅ official ReSukiSU Manager certificate paired: size=$OFFICIAL_SIZE sha256=$OFFICIAL_HASH"
+          echo "✅ final kernel config: KSU + multi-manager + SUSFS 2.2.0"
+          echo "✅ ReSukiSU signature table present"
+
+      - name: Verify vanilla kernel contract
+        if: matrix.variant == 'vanilla'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="$GITHUB_WORKSPACE/kernel-source"
+          DC="$SRC/out/.config"
+          IMG="$SRC/out/arch/arm64/boot/Image.gz-dtb"
+          [ -f "$DC" ] || { echo "::error::final .config missing"; exit 1; }
+          [ -f "$IMG" ] || { echo "::error::Image.gz-dtb missing"; exit 1; }
+          ! grep -qE '^CONFIG_KSU=y$' "$DC" || { echo "::error::CONFIG_KSU leaked into vanilla build"; exit 1; }
+          ! grep -qE '^CONFIG_KSU_SUSFS=y$' "$DC" || { echo "::error::SUSFS leaked into vanilla build"; exit 1; }
+          echo "✅ vanilla kernel: no KSU/SUSFS present, Image.gz-dtb built"
+
+      - name: Package AnyKernel3 & Generate SHA256
+        uses: ./.github/actions/package-anykernel
+        with:
+          ksu_fork: ${{ matrix.variant == 'resukisu_susfs' && 'ReSuKISU' || '' }}
+          include_susfs: ${{ matrix.variant == 'resukisu_susfs' }}
+          include_bbg: ${{ inputs.include_bbg }}
+          include_bbr: ${{ inputs.include_bbr }}
+          resukisu_bootstrap: ${{ inputs.manifest_name == 'camellia' && matrix.variant == 'resukisu_susfs' }}
+
+      - name: Verify ReSukiSU userspace bootstrap payload
+        if: inputs.manifest_name == 'camellia' && matrix.variant == 'resukisu_susfs'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP=$(find . -maxdepth 1 -type f -name '*.zip' | head -n 1)
+          [ -n "$ZIP" ] || { echo "::error::kernel ZIP missing"; exit 1; }
+          unzip -t "$ZIP" >/dev/null
+          for item in resukisu-bootstrap/ksud resukisu-bootstrap/ksud.susmap resukisu-bootstrap/ksud.sha256; do
+            unzip -l "$ZIP" | grep -q "$item" || {
+              echo "::error::ReSukiSU bootstrap payload missing: $item"; exit 1;
+            }
+          done
+          unzip -l "$ZIP" | grep -q 'resukisu-bootstrap/libadbroot.so' || {
+            echo "::error::libadbroot bootstrap missing from ZIP"; exit 1;
+          }
+          for item in resukisu-bootstrap/meta-overlayfs-13100-1.3.1.zip resukisu-bootstrap/bootstrap-meta.sh; do
+            unzip -l "$ZIP" | grep -q "$item" || {
+              echo "::error::bundled metamodule payload missing: $item"; exit 1;
+            }
+          done
+          mkdir -p /tmp/resukisu-bootstrap-audit
+          unzip -p "$ZIP" resukisu-bootstrap/ksud > /tmp/resukisu-bootstrap-audit/launcher
+          unzip -p "$ZIP" resukisu-bootstrap/ksud.susmap > /tmp/resukisu-bootstrap-audit/ksud
+          unzip -p "$ZIP" resukisu-bootstrap/ksud.sha256 > /tmp/resukisu-bootstrap-audit/ksud.sha256
+          unzip -p "$ZIP" resukisu-bootstrap/libadbroot.so > /tmp/resukisu-bootstrap-audit/libadbroot.so
+          unzip -p "$ZIP" resukisu-bootstrap/meta-overlayfs-13100-1.3.1.zip > /tmp/resukisu-bootstrap-audit/meta-overlayfs.zip
+          unzip -p "$ZIP" resukisu-bootstrap/bootstrap-meta.sh > /tmp/resukisu-bootstrap-audit/bootstrap-meta.sh
+          bash -n /tmp/resukisu-bootstrap-audit/launcher
+          grep -Fq 'REAL="$BASE/ksud.susmap"' /tmp/resukisu-bootstrap-audit/launcher
+          grep -Fq 'EXPECTED_SHA256_FILE="$BASE/ksud.sha256"' /tmp/resukisu-bootstrap-audit/launcher
+          test "$(stat -c '%s' /tmp/resukisu-bootstrap-audit/ksud)" -gt 1000000
+          test "$(stat -c '%s' /tmp/resukisu-bootstrap-audit/libadbroot.so)" -gt 1000
+          unzip -t /tmp/resukisu-bootstrap-audit/meta-overlayfs.zip >/dev/null
+          unzip -p /tmp/resukisu-bootstrap-audit/meta-overlayfs.zip module.prop | grep -q '^metamodule=1$'
+          bash -n /tmp/resukisu-bootstrap-audit/bootstrap-meta.sh
+          grep -Fq 'KSUD_MARKER="$BASE/.ksud-susmap-installed"' /tmp/resukisu-bootstrap-audit/bootstrap-meta.sh
+          grep -Fq '[ -s "$KSUD_MARKER" ] || exit 0' /tmp/resukisu-bootstrap-audit/bootstrap-meta.sh
+          file /tmp/resukisu-bootstrap-audit/ksud /tmp/resukisu-bootstrap-audit/libadbroot.so
+          test "$(sha256sum /tmp/resukisu-bootstrap-audit/ksud | awk '{print $1}')" = c70756391ff6994ccc7b8d85ac43459cf9d087f90d22c52c50bfa3c2be3b2a3a
+          test "$(awk 'NR==1 {print $1}' /tmp/resukisu-bootstrap-audit/ksud.sha256)" = c70756391ff6994ccc7b8d85ac43459cf9d087f90d22c52c50bfa3c2be3b2a3a
+          strings -a /tmp/resukisu-bootstrap-audit/ksud > /tmp/resukisu-bootstrap-audit/ksud.strings
+          grep -Fq '4.2.0-rc1-18-gcdce8bb8 (uapi: 2)' /tmp/resukisu-bootstrap-audit/ksud.strings
+          grep -Fq 'add_sus_map' /tmp/resukisu-bootstrap-audit/ksud.strings
+          grep -aob '35079' /tmp/resukisu-bootstrap-audit/ksud >/dev/null
+          sha256sum /tmp/resukisu-bootstrap-audit/ksud /tmp/resukisu-bootstrap-audit/libadbroot.so /tmp/resukisu-bootstrap-audit/meta-overlayfs.zip
+          echo "✅ official ReSukiSU 4.2/35079 + bundled meta-overlayfs payload verified"
+
+      - name: Debug Workspace Files
+        run: |
+          echo "📂 File di Root Workspace:"
+          ls -la
+          echo "📂 File di AnyKernel3:"
+          ls -la AnyKernel3/ || true
+
+      - name: Upload Kernel Release Assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-assets-${{ matrix.variant }}
+          path: |
+           *.zip
+           *.sha256
+           changelog.txt
+           commit_link.txt
+          if-no-files-found: error
+
+      - name: Send Telegram Failure Notification & Cancel Jobs
+        if: failure()
+        env:
+          TELEGRAM_TOKEN: "${{ secrets.TELEGRAM_TOKEN }}"
+          TELEGRAM_CHAT_ID: "${{ secrets.TELEGRAM_CHAT_ID }}"
+          MANIFEST: "${{ inputs.manifest_name }}"
+          KSU: "${{ matrix.variant == 'resukisu_susfs' && 'ReSuKISU' || 'vanilla' }}"
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          python3 .github/scripts/telegram_notify.py failure
+          # The runner's GITHUB_TOKEN cannot cancel this reusable-workflow run
+          # from inside the job (403). Do not turn the original error into a
+          # second misleading failure.
+          true
+          
+  # =========================================================================
+  # JOB 2: BUILD MANAGER APP
+  # =========================================================================
+  
+  build-manager:
+    # The Manager APK is the official ReSukiSU build — only relevant when the
+    # resukisu_susfs variant is part of this run.
+    if: |
+      !cancelled() && (
+        inputs.build_target == 'both' || inputs.build_target == 'manager_only'
+      ) && (inputs.build_variant == 'both' || inputs.build_variant == 'resukisu_susfs')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Clone & Build Manager APK
+        run: bash .github/scripts/build_manager.sh "ReSuKISU"
+
+      - name: Upload Manager APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: manager-apk-artifact
+          path: output_apk/
+          retention-days: 7
+
+# =========================================================================
+# JOB 3: PUBLISH TO GITHUB RELEASES & TELEGRAM
+# =========================================================================
+  publish-release:
+    needs: [build-kernel, build-manager]
+    if: |
+      always() && !cancelled() && (
+        (inputs.build_target == 'both' && needs.build-kernel.result == 'success') ||
+        (inputs.build_target == 'kernel_only' && needs.build-kernel.result == 'success') ||
+        (inputs.build_target == 'manager_only' && needs.build-manager.result == 'success')
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_assets
+          merge-multiple: true
+
+      - name: Prepare Apk Metadata & Cleanup
+        run: |
+          DATE_TAG=$(date +'%Y%m%d-%H%M')
+          echo "DATE_TAG=$DATE_TAG" >> $GITHUB_ENV
+
+          # 1. Hapus file APK 32-bit jika terikut secara tidak sengaja (sebagai pengaman tambahan)
+          find release_assets -type f \( -name "*armeabi*" -o -name "*x86*" \) -delete 2>/dev/null || true
+
+          # 2. Read Metadata (Ambil nama ZIP untuk judul rilis GitHub & Telegram)
+          ZIP_FILE=$(find release_assets -type f -name "*.zip" | head -n 1)
+          [ -n "$ZIP_FILE" ] && echo "RELEASE_TITLE=Lotus Kernel - $(basename "$ZIP_FILE")" >> $GITHUB_ENV
+
+      - name: Auto-Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.DATE_TAG }}
+          name: "${{ env.RELEASE_TITLE }}"
+          files: release_assets/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Send Built Files to Telegram
+        env:
+          TELEGRAM_TOKEN: "${{ secrets.TELEGRAM_TOKEN }}"
+          TELEGRAM_CHAT_ID: "${{ secrets.TELEGRAM_CHAT_ID }}"
+          KSU: "${{ inputs.build_variant }}"
+          SUSFS: "${{ inputs.build_variant == 'both' || inputs.build_variant == 'resukisu_susfs' }}"
+          DROIDSPACE: "${{ inputs.include_droidspace }}"
+          BBG: "${{ inputs.include_bbg }}"
+          LTO: "${{ inputs.include_lto_o3 }}"
+          WG: "${{ inputs.include_wireguard }}"
+          F2FS: "${{ inputs.include_f2fs }}"
+          ZSTD: "${{ inputs.include_zstd }}"
+          BBR: "${{ inputs.include_bbr }}"
+          TTL: "${{ inputs.include_ttl }}"
+          GH_SERVER: "${{ github.server_url }}"
+          GH_REPO: "${{ github.repository }}"
+          GH_SHA: "${{ github.sha }}"
+        run: python3 .github/scripts/send_telegram.py

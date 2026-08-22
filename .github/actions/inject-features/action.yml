@@ -1,0 +1,214 @@
+name: 'Inject Advanced Kernel Features'
+description: 'Inject customizable kernel features, SUSFS, DroidSpace, BBG, and optimizations into defconfig and source tree safely'
+
+inputs:
+  defconfig:
+    description: 'Target Defconfig File Name'
+    required: true
+  enable_bbg:
+    description: 'Enable Baseband-Guard Protection'
+    required: false
+    default: 'true'
+  enable_lto_o3:
+    description: 'Enable ThinLTO & -O3 Optimizations'
+    required: false
+    default: 'true'
+  enable_wireguard:
+    description: 'Inject WireGuard'
+    required: false
+    default: 'true'
+  enable_f2fs:
+    description: 'Inject F2FS Backport'
+    required: false
+    default: 'true'
+  enable_zstd:
+    description: 'Enable ZRAM ZSTD'
+    required: false
+    default: 'true'
+  enable_bbr:
+    description: 'Enable TCP BBR / Westwood'
+    required: false
+    default: 'true'
+  enable_ttl:
+    description: 'Enable TTL / HL Spoofing'
+    required: false
+    default: 'true'
+  enable_droidspace:
+    description: 'Enable DroidSpace Namespaces & OverlayFS (Mountify/Magic Mount)'
+    required: false
+    default: 'true'
+  enable_susfs:
+    description: 'Inject SUSFS Anti-Detection & Library Hiding'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Process Granular Kernel Injections
+      shell: bash
+      run: |
+        cd kernel-source
+        DEFCONFIG="arch/arm64/configs/${{ inputs.defconfig }}"
+
+        # Helper function untuk menyisipkan CONFIG ke defconfig tanpa duplikasi
+        set_config() {
+          local key="$1"
+          local val="$2"
+          sed -i "/^#\? *${key}[ =]/d" "$DEFCONFIG"
+          echo "${key}=${val}" >> "$DEFCONFIG"
+        }
+
+        # -----------------------------------------------------------------
+        # 1. Baseband-Guard (BBG Protection)
+        # -----------------------------------------------------------------
+        if [ "${{ inputs.enable_bbg }}" = "true" ]; then
+          echo "🛡️ Applying Baseband-guard..."
+          wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash || true
+          set_config "CONFIG_BBG" "y"
+        fi
+
+        # -----------------------------------------------------------------
+        # 2. Compiler Optimizations (ThinLTO & -O3)
+        # -----------------------------------------------------------------
+        if [ "${{ inputs.enable_lto_o3 }}" = "true" ]; then
+          echo "🚀 Injecting Compiler Optimizations (-O3 & ThinLTO)..."
+          if ! grep -q "-O3" Makefile; then
+            sed -i 's/-O2/-O3/g' Makefile || true
+          fi
+          set_config "CONFIG_LTO" "y"
+          set_config "CONFIG_LTO_CLANG" "y"
+          set_config "CONFIG_THINLTO" "y"
+          set_config "CONFIG_ARCH_SUPPORTS_THINLTO" "y"
+        fi
+
+        # -----------------------------------------------------------------
+        # 3. WireGuard Protocol (Physical Copy + Anti-Duplicate Fix)
+        # -----------------------------------------------------------------
+        if [ "${{ inputs.enable_wireguard }}" = "true" ]; then
+          echo "🌐 Installing WireGuard..."
+
+          # Hapus seluruh direktori duplikat WireGuard lama
+          rm -rf drivers/net/wireguard net/wireguard /tmp/wireguard
+
+          # Bersihkan pendaftaran wireguard lama dari Makefile dan Kconfig
+          sed -i '/wireguard/d' drivers/net/Kconfig 2>/dev/null || true
+          sed -i '/wireguard/d' drivers/net/Makefile 2>/dev/null || true
+          sed -i '/wireguard/d' net/Kconfig 2>/dev/null || true
+          sed -i '/wireguard/d' net/Makefile 2>/dev/null || true
+
+          # Clone & Copy source WireGuard secara fisik hanya ke net/wireguard
+          git clone --depth=1 https://github.com/WireGuard/wireguard-linux-compat.git /tmp/wireguard
+          cp -r /tmp/wireguard/src net/wireguard
+
+          # Kernel 4.14 has NO include/uapi/linux/time_types.h and no __kernel_timespec
+          # in uapi headers, so wireguard's compat.h normally PROVIDES that struct.
+          # Some vendor bases backport time64/time and already define timespec, causing
+          # redefinition errors. Detect by inspecting time.h/time64.h and patch compat.h.
+          if grep -qE '(^struct timespec|#define[[:space:]]+__kernel_timespec[[:space:]]+timespec)' include/uapi/linux/time.h include/linux/time64.h 2>/dev/null; then
+            if [ -f "net/wireguard/compat/compat.h" ]; then
+              echo "🔧 Kernel already defines timespec/__kernel_timespec — patching compat.h to avoid redefinition..."
+              sed -i '/struct __kernel_timespec {/,/};/s/^/\/\//' net/wireguard/compat/compat.h
+            fi
+          else
+            echo "ℹ️ Kernel 4.14 (no time_types.h/time64 macro) — keeping compat.h __kernel_timespec intact"
+          fi
+
+          # Daftarkan Kconfig & Makefile secara bersih di net/
+          sed -i '/endmenu/i source "net/wireguard/Kconfig"' net/Kconfig || echo 'source "net/wireguard/Kconfig"' >> net/Kconfig
+          echo 'obj-$(CONFIG_WIREGUARD) += wireguard/' >> net/Makefile
+
+          rm -rf /tmp/wireguard
+          set_config "CONFIG_WIREGUARD" "y"
+          echo "✅ WireGuard successfully injected without duplicates!"
+        fi
+
+        # -----------------------------------------------------------------
+        # 4. F2FS Stable Backport
+        # -----------------------------------------------------------------
+        if [ "${{ inputs.enable_f2fs }}" = "true" ]; then
+          echo "💾 Fetching F2FS Backport..."
+          if ! git remote | grep -q "^f2fs-stable$"; then
+            git remote add f2fs-stable https://git.kernel.org/pub/scm/linux/kernel/git/jaegeuk/f2fs-stable.git || true
+          fi
+          git fetch --depth=50 f2fs-stable linux-4.14 || true
+          git merge --no-edit FETCH_HEAD || echo "⚠️ F2FS merge conflict, skipping auto-merge..."
+
+          set_config "CONFIG_F2FS_FS" "y"
+          set_config "CONFIG_F2FS_STAT_FS" "y"
+          set_config "CONFIG_F2FS_FS_XATTR" "y"
+          set_config "CONFIG_F2FS_FS_POSIX_ACL" "y"
+          set_config "CONFIG_F2FS_FS_SECURITY" "y"
+          set_config "CONFIG_F2FS_CHECK_FS" "y"
+        fi
+
+        # -----------------------------------------------------------------
+        # 5. ZRAM ZSTD Compression
+        # -----------------------------------------------------------------
+        if [ "${{ inputs.enable_zstd }}" = "true" ]; then
+          echo "📦 Enabling ZRAM ZSTD Compression..."
+          set_config "CONFIG_ZSMALLOC" "y"
+          set_config "CONFIG_ZRAM" "y"
+          set_config "CONFIG_CRYPTO_ZSTD" "y"
+          set_config "CONFIG_ZSTD_COMPRESS" "y"
+          set_config "CONFIG_ZSTD_DECOMPRESS" "y"
+          set_config "CONFIG_ZRAM_DEF_COMP" "\"zstd\""
+        fi
+
+        # -----------------------------------------------------------------
+        # 6. TCP Congestion Control (BBR / Westwood)
+        # -----------------------------------------------------------------
+        if [ "${{ inputs.enable_bbr }}" = "true" ]; then
+          echo "⚡ Enabling TCP BBR & Westwood..."
+          set_config "CONFIG_NET_SCHED" "y"
+          set_config "CONFIG_NET_SCH_FQ" "y"
+          set_config "CONFIG_NET_SCH_FQ_CODEL" "y"
+          set_config "CONFIG_TCP_CONG_BBR" "y"
+          set_config "CONFIG_TCP_CONG_WESTWOOD" "y"
+          set_config "CONFIG_DEFAULT_TCP_CONG" "\"bbr\""
+        fi
+
+        # -----------------------------------------------------------------
+        # 7. TTL / HL Packet Spoofing
+        # -----------------------------------------------------------------
+        if [ "${{ inputs.enable_ttl }}" = "true" ]; then
+          echo "🛡️ Enabling TTL/HL Spoofing..."
+          set_config "CONFIG_NETFILTER_XT_TARGET_HL" "y"
+          set_config "CONFIG_IP_NF_TARGET_TTL" "y"
+          set_config "CONFIG_IP6_NF_TARGET_HL" "y"
+          set_config "CONFIG_NETFILTER_XT_MATCH_HL" "y"
+        fi
+
+        # -----------------------------------------------------------------
+        # 8. DroidSpace, Mountify (OverlayFS) & SUSFS Anti-Detection
+        # -----------------------------------------------------------------
+        if [ "${{ inputs.enable_droidspace }}" = "true" ]; then
+          echo "🧱 Enabling DroidSpace & OverlayFS Magic Mount..."
+          set_config "CONFIG_OVERLAY_FS" "y"
+          set_config "CONFIG_OVERLAY_FS_REDIRECT_DIR" "y"
+          set_config "CONFIG_OVERLAY_FS_INDEX" "y"
+          set_config "CONFIG_NAMESPACES" "y"
+          set_config "CONFIG_UTS_NS" "y"
+          set_config "CONFIG_IPC_NS" "y"
+          set_config "CONFIG_USER_NS" "y"
+          set_config "CONFIG_PID_NS" "y"
+          set_config "CONFIG_NET_NS" "y"
+        fi
+
+        if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+          echo "🕵️ Injecting SUSFS Anti-Detection & Library Hiding..."
+          set_config "CONFIG_KSU_SUSFS" "y"
+          set_config "CONFIG_KSU_SUSFS_SUS_PATH" "y"
+          set_config "CONFIG_KSU_SUSFS_SUS_MOUNT" "y"
+          set_config "CONFIG_KSU_SUSFS_SUS_KSTAT" "y"
+          set_config "CONFIG_KSU_SUSFS_SPOOF_UNAME" "y"
+          set_config "CONFIG_KSU_SUSFS_ENABLE_LOG" "y"
+          set_config "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS" "y"
+          set_config "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG" "y"
+          set_config "CONFIG_KSU_SUSFS_OPEN_REDIRECT" "y"
+          # Real Flyme 4.14 maps/smaps/rollup/pagemap hooks are installed by
+          # apply_susmap_414.py; this is not a config-only feature claim.
+          set_config "CONFIG_KSU_SUSFS_SUS_MAP" "y"
+        else
+          sed -i '/CONFIG_KSU_SUSFS/d' "$DEFCONFIG"
+        fi

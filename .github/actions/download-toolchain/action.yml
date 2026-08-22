@@ -1,0 +1,85 @@
+Name: "Download Toolchains"
+description: "Download selected Clang and GCC toolchains for kernel building"
+inputs:
+  toolchain:
+    description: "Toolchain selection"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Download Toolchains
+      shell: bash
+      run: |
+        mkdir -p toolchain
+        cd toolchain
+
+        case "${{ inputs.toolchain }}" in
+          "clang-22")
+            echo "Downloading LLVM/Clang 22.1.0..."
+            wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.0/LLVM-22.1.0-Linux-X64.tar.xz
+            mkdir clang && tar -xf LLVM-22.1.0-Linux-X64.tar.xz -C clang --strip-components=1
+            rm -f LLVM-22.1.0-Linux-X64.tar.xz
+            clang/bin/clang --version
+            ;;
+          "proton-clang")
+            echo "Downloading Proton-Clang..."
+            git clone --depth=1 https://github.com/kdrag0n/proton-clang.git clang
+            ;;
+          "zyc-clang")
+            echo "Downloading ZyC Clang..."
+            # 👇 PERBAIKAN: Ditambahkan '|| true' di akhir baris ini agar tidak crash saat grep gagal
+            URL=$(curl -sSL -H "User-Agent: Mozilla/5.0" "https://gitlab.com/api/v4/projects/28003182/releases" | jq -r '.[0].assets.links[]?.url // .[0].description // empty' 2>/dev/null | grep -oE 'https://[^\s"\)]+\.tar\.(gz|xz)' | head -n 1 || true)
+
+            if [ -z "$URL" ]; then
+              echo "⚠️ Release API blocked, attempting GitLab Package Registry..."
+              PKG_DATA=$(curl -sSL -H "User-Agent: Mozilla/5.0" "https://gitlab.com/api/v4/projects/28003182/packages")
+              PKG_ID=$(echo "$PKG_DATA" | jq -r '.[0].id // empty' 2>/dev/null)
+              PKG_VER=$(echo "$PKG_DATA" | jq -r '.[0].version // empty' 2>/dev/null)
+
+              if [ -n "$PKG_ID" ] && [ -n "$PKG_VER" ]; then
+                FILE_NAME=$(curl -sSL -H "User-Agent: Mozilla/5.0" "https://gitlab.com/api/v4/projects/28003182/packages/$PKG_ID/package_files" | jq -r '.[0].file_name // empty' 2>/dev/null)
+                [ -n "$FILE_NAME" ] && URL="https://gitlab.com/api/v4/projects/28003182/packages/generic/ZyC-Clang/$PKG_VER/$FILE_NAME"
+              fi
+            fi
+
+            SUCCESS=false
+            if [ -n "$URL" ]; then
+              echo "🔗 Downloading from: $URL"
+              curl -sSL -H "User-Agent: Mozilla/5.0" "$URL" -o zyc-clang.archive || true
+              
+              if tar -tf zyc-clang.archive >/dev/null 2>&1; then
+                echo "✅ ZyC Clang downloaded and verified!"
+                mkdir clang
+                tar -xf zyc-clang.archive -C clang --strip-components=1 2>/dev/null || tar -xf zyc-clang.archive -C clang
+                rm -f zyc-clang.archive
+                SUCCESS=true
+              fi
+            fi
+
+            if [ "$SUCCESS" = false ]; then
+              echo "⚠️ ZyC Clang failed/blocked. Fallback to Official AOSP Clang..."
+              rm -rf clang zyc-clang.archive
+              wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902.tar.gz
+              mkdir clang && tar -xf clang-r383902.tar.gz -C clang
+              rm -f clang-r383902.tar.gz
+            fi
+            ;;
+          "azure-clang")
+            echo "Downloading Azure Clang..."
+            git clone --depth=1 https://github.com/P3RF3CT-ST34LTH/azure-clang.git clang
+            ;;
+          "eva-clang")
+            echo "Downloading Eva GCC / Clang..."
+            git clone --depth=1 https://github.com/mvaisakh/gcc-arm64.git clang
+            ;;
+          *)
+            echo "Downloading Official AOSP Clang..."
+            wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902.tar.gz
+            mkdir clang && tar -xf clang-r383902.tar.gz -C clang
+            rm -f clang-r383902.tar.gz
+            ;;
+        esac
+        
+        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git gcc64
+        git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git gcc32

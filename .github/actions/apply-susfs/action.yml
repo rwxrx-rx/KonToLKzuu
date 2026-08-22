@@ -1,0 +1,124 @@
+name: "Apply SUSFS Patch & Configs"
+description: "Install SUSFS v2.2.0 for camellia 4.14 via pre-merged whole-file tree (3-way merged: camellia device code + FlopKernel/sidex15 v2.2.0 hooks). No fuzzy patching."
+inputs:
+  resukisu_legacy_hooks:
+    description: "Apply exact Camellia ReSukiSU Inline + SUS_MAP hooks"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install SUSFS v2.2.0 (pre-merged tree)
+      shell: bash
+      run: |
+        set -e
+        TREE="$GITHUB_WORKSPACE/patches/susfs_v220/tree"
+        cd kernel-source
+        echo "==============================================="
+        echo " SUSFS v2.2.0 install (camellia 4.14.357-openela)"
+        echo " Method: pre-merged whole-file overwrite (no patch/fuzz)"
+        echo "==============================================="
+
+        if [ ! -d "$TREE" ]; then
+          echo "::error::merged tree not found at $TREE"
+          exit 1
+        fi
+
+        # ---------------------------------------------------------------
+        # 1. Overwrite VFS + susfs core files with the pre-merged v2.2.0
+        #    versions. These were produced by a diff3 3-way merge:
+        #      ours=camellia base, base=FlopKernel-stripped, theirs=FlopKernel v2.2.0
+        #    so device-specific camellia code is preserved and all susfs hooks
+        #    are internally consistent at v2.2.0.
+        # ---------------------------------------------------------------
+        echo "[1] Installing merged tree files..."
+        COUNT=0
+        while IFS= read -r src; do
+          rel="${src#$TREE/}"
+          mkdir -p "$(dirname "$rel")"
+          cp -f "$src" "$rel"
+          COUNT=$((COUNT+1))
+          echo "    -> $rel"
+        done < <(find "$TREE" -type f)
+        echo "    installed $COUNT files"
+
+        if [ "${{ inputs.resukisu_legacy_hooks }}" = "true" ]; then
+          # ReSukiSU SUSFS inline mode requires real call-sites in the exact
+          # post-merge vendor tree. Apply them only after the SUSFS tree exists.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/apply_resukisu_inline_hooks.py" "$GITHUB_WORKSPACE/kernel-source"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/validate_setresuid_susfs_contract.py" "$GITHUB_WORKSPACE/kernel-source"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/test_susmap_policy_matrix.py"
+          # SUS_MAP needs real procfs hooks on legacy 4.14. The injector is
+          # exact-pattern/fail-closed and never imports a foreign task_mmu.c.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/apply_susmap_414.py" "$GITHUB_WORKSPACE/kernel-source"
+        fi
+        echo "    SUSFS_VERSION: $(grep -E '^#define SUSFS_VERSION' include/linux/susfs.h)"
+
+        # ---------------------------------------------------------------
+        # 2. IDA compat shim (4.14 lacks ida_alloc_min/ida_free that the
+        #    merged fs/namespace.c SUS_MOUNT code calls). Backed by the
+        #    legacy ida_simple_* API that 4.14 ships. No-op on >=4.19.
+        # ---------------------------------------------------------------
+        echo "[2] Installing IDA compat shim..."
+        SHIM='include/linux/susfs_ida_compat.h'
+        cat > "$SHIM" <<'SHIMEOF'
+        #ifndef _SUSFS_IDA_COMPAT_H
+        #define _SUSFS_IDA_COMPAT_H
+        #include <linux/version.h>
+        #include <linux/idr.h>
+        #include <linux/gfp.h>
+        #if LINUX_VERSION_CODE < KERNEL_VERSION(4,19,0)
+        #ifndef SUSFS_HAVE_IDA_ALLOC_MIN
+        #define SUSFS_HAVE_IDA_ALLOC_MIN
+        static inline int ida_alloc_min(struct ida *ida, unsigned int min, gfp_t gfp)
+        {
+        	return ida_simple_get(ida, min, 0, gfp);
+        }
+        static inline void ida_free(struct ida *ida, unsigned int id)
+        {
+        	ida_simple_remove(ida, id);
+        }
+        #endif
+        #endif
+        #endif /* _SUSFS_IDA_COMPAT_H */
+        SHIMEOF
+        sed -i 's/^        //' "$SHIM"
+        # ensure namespace.c + susfs.h pull the shim before using the modern API
+        if ! grep -q "susfs_ida_compat.h" fs/namespace.c; then
+          sed -i '1i#include <linux/susfs_ida_compat.h>' fs/namespace.c
+        fi
+        if ! grep -q "susfs_ida_compat.h" include/linux/susfs.h; then
+          sed -i '1i#include <linux/susfs_ida_compat.h>' include/linux/susfs.h
+        fi
+
+        # ---------------------------------------------------------------
+        # 3. Ensure susfs.o builds.
+        # ---------------------------------------------------------------
+        if ! grep -q 'susfs.o' fs/Makefile; then
+          echo 'obj-$(CONFIG_KSU_SUSFS) += susfs.o' >> fs/Makefile
+          echo "[3] Added susfs.o to fs/Makefile"
+        else
+          echo "[3] susfs.o already present in fs/Makefile"
+        fi
+
+        # ---------------------------------------------------------------
+        # 4. Sanity: no leftover conflict markers, version correct.
+        # ---------------------------------------------------------------
+        echo "[4] Sanity checks..."
+        MARKER_HIT=0
+        while IFS= read -r src; do
+          rel="${src#$TREE/}"
+          if grep -nE '^(<<<<<<<|>>>>>>>|\|\|\|\|\|\|\|)' "$rel" 2>/dev/null; then
+            echo "::error::conflict marker in $rel"
+            MARKER_HIT=1
+          fi
+        done < <(find "$TREE" -type f)
+        if [ "$MARKER_HIT" = "1" ]; then
+          echo "::error::conflict markers found in installed files"
+          exit 1
+        fi
+        echo "    no conflict markers in installed files ✓"
+        ls -la fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h include/linux/susfs_ida_compat.h
+        echo "    Version: $(grep -E '^#define SUSFS_VERSION' include/linux/susfs.h)"
+        echo "SUSFS v2.2.0 install done."

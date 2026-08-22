@@ -1,0 +1,215 @@
+name: "Setup KSU Fork"
+description: "Prepare and setup the ReSukiSU source (the only supported KernelSU fork in this pipeline)"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup KernelSU Source
+      shell: bash
+      run: |
+        cd kernel-source
+
+        FORK="ReSuKISU"
+        echo "⚙️ Processing KSU Fork: $FORK (only supported fork)"
+
+        REPO="https://github.com/ReSukiSU/ReSukiSU.git"
+        BRANCH="main"
+        PINNED_COMMIT="cdce8bb8c8bf2167d21751e39ca6cdc4ad154678"
+        KSU_EXPECTED_REV_COUNT=4379
+        KSU_EXPECTED_VERSION=35079
+
+        echo "🧹 Cleaning previous drivers/kernelsu and temp folders..."
+        rm -rf drivers/kernelsu KernelSU KernelSU_temp
+
+        echo "📥 Cloning $FORK ($REPO - branch $BRANCH)..."
+        if ! git clone --depth=1 -b "$BRANCH" "$REPO" KernelSU_temp 2>/dev/null; then
+          echo "⚠️ Branch $BRANCH not found, attempting default branch..."
+          git clone --depth=1 "$REPO" KernelSU_temp
+        fi
+        if [ -n "${PINNED_COMMIT:-}" ]; then
+          # ReSukiSU derives KSU_VERSION from the complete Git revision count.
+          # Restore the full official history before checking out ABI 35079.
+          git -C KernelSU_temp fetch --unshallow origin "$BRANCH"
+          git -C KernelSU_temp fetch origin "$PINNED_COMMIT"
+          git -C KernelSU_temp checkout --detach "$PINNED_COMMIT"
+          test "$(git -C KernelSU_temp rev-parse HEAD)" = "$PINNED_COMMIT" || {
+            echo "::error::KSU source commit pin mismatch"; exit 1;
+          }
+          test "$(git -C KernelSU_temp rev-parse --is-shallow-repository)" = false
+          test "$(git -C KernelSU_temp rev-list --count HEAD)" = "$KSU_EXPECTED_REV_COUNT"
+          test "$((30000 + KSU_EXPECTED_REV_COUNT + 700))" = "$KSU_EXPECTED_VERSION"
+        fi
+
+        mkdir -p drivers/kernelsu
+
+        if [ -d "KernelSU_temp/kernel" ]; then
+          echo "🚚 Linking KSU source from KernelSU_temp/kernel to drivers/kernelsu..."
+          rm -rf drivers/kernelsu
+          ln -s ../KernelSU_temp/kernel drivers/kernelsu
+        elif [ -f "KernelSU_temp/Makefile" ]; then
+          echo "🚚 Linking KSU source from KernelSU_temp to drivers/kernelsu..."
+          rm -rf drivers/kernelsu
+          ln -s ../KernelSU_temp drivers/kernelsu
+        else
+          echo "❌ ERROR: No valid Makefile found in cloned KSU repository!"
+          exit 1
+        fi
+        test -L drivers/kernelsu
+        test -e drivers/kernelsu/../.git || { echo "::error::ReSukiSU Git context missing"; exit 1; }
+        KSU_PINNED_COMMIT="$(git -C KernelSU_temp rev-parse HEAD)"
+        test -n "$KSU_PINNED_COMMIT"
+        echo "ReSukiSU source commit: $KSU_PINNED_COMMIT"
+
+        # Sinkronisasi folder UAPI & injeksi include path
+        echo "🔧 Fixing KSU UAPI header directories & includes..."
+        mkdir -p drivers/kernelsu/uapi
+        mkdir -p drivers/kernelsu/policy/uapi
+        mkdir -p include/uapi
+
+        find KernelSU_temp/ drivers/kernelsu/ -type d -name "uapi" 2>/dev/null | while read -r ufolder; do
+          cp -rf "$ufolder"/* drivers/kernelsu/uapi/ 2>/dev/null || true
+          cp -rf "$ufolder"/* drivers/kernelsu/policy/uapi/ 2>/dev/null || true
+          cp -rf "$ufolder"/* include/uapi/ 2>/dev/null || true
+        done
+
+        # Pair the built-in kernel ABI with official ReSukiSU 4.2 build 35079.
+        # Never inject the archived legacy 11872 ABI into a modern manager build.
+        KSU_ABI_VERSION=35079
+        if [ -f "drivers/kernelsu/Kbuild" ]; then
+          sed -i '/-DKERNEL_SU_VERSION=/d' drivers/kernelsu/Kbuild
+          sed -i "1iccflags-y += -I\$(srctree)/drivers/kernelsu -I\$(srctree)/drivers/kernelsu/include -DKERNEL_SU_VERSION=$KSU_ABI_VERSION" drivers/kernelsu/Kbuild
+          sed -i -E "s/^[[:space:]]*KSU_VERSION[[:space:]]*:=.*/KSU_VERSION := $KSU_ABI_VERSION/" drivers/kernelsu/Kbuild
+          printf '%s\n' "ccflags-y += -DKSU_VERSION=$KSU_ABI_VERSION -DKERNEL_SU_VERSION=$KSU_ABI_VERSION" >> drivers/kernelsu/Kbuild
+          grep -q "KSU_VERSION := $KSU_ABI_VERSION" drivers/kernelsu/Kbuild
+          grep -q -- "-DKSU_VERSION=$KSU_ABI_VERSION" drivers/kernelsu/Kbuild
+        fi
+        if [ -f "drivers/kernelsu/Makefile" ]; then
+          sed -i '/-DKERNEL_SU_VERSION=/d' drivers/kernelsu/Makefile
+          sed -i "1iccflags-y += -I\$(srctree)/drivers/kernelsu -I\$(srctree)/drivers/kernelsu/include -DKERNEL_SU_VERSION=$KSU_ABI_VERSION" drivers/kernelsu/Makefile
+          sed -i -E "s/^[[:space:]]*KSU_VERSION[[:space:]]*:=.*/KSU_VERSION := $KSU_ABI_VERSION/" drivers/kernelsu/Makefile
+        fi
+        if grep -R -nE 'KERNEL_SU_VERSION[[:space:]]*(=| )+11872|-DKERNEL_SU_VERSION=11872' drivers/kernelsu; then
+          echo '::error::legacy KSU ABI 11872 remains'
+          exit 1
+        fi
+
+        # Preserve ReSukiSU's upstream mutually-exclusive hooking choice.
+        # This target is pure SUSFS Inline: CONFIG_KSU_SUSFS is selected later,
+        # while Manual and Tracepoint stay disabled. Never rewrite the Kconfig
+        # into the old dual-hook layout or alter its runtime branch ordering.
+        KSU_KCONFIG="drivers/kernelsu/Kconfig"
+        grep -q 'prompt "KernelSU Hooking Method"' "$KSU_KCONFIG"
+        grep -q '^choice$' "$KSU_KCONFIG"
+        grep -q '^endchoice$' "$KSU_KCONFIG"
+        grep -q '^config KSU_MANUAL_HOOK$' "$KSU_KCONFIG"
+        grep -q '^config KSU_SUSFS$' "$KSU_KCONFIG"
+        KSUD_RUNTIME="drivers/kernelsu/runtime/ksud_integration.c"
+        grep -q '^#elif defined(CONFIG_KSU_SUSFS)$' "$KSUD_RUNTIME"
+        ! grep -q 'CONFIG_KSU_SUSFS) && !defined(CONFIG_KSU_MANUAL_HOOK)' "$KSUD_RUNTIME"
+
+        # Embed an ASCII ABI marker in the built-in KSU core. The dispatch object
+        # is not guaranteed to be linked on every legacy config; core/init.c is.
+        CORE_INIT="drivers/kernelsu/core/init.c"
+        if [ -f "$CORE_INIT" ] && ! grep -q 'resukisu_kernel_abi_35079' "$CORE_INIT"; then
+          sed -i '1i__attribute__((used, section(".rodata"))) static const char resukisu_kernel_abi_35079[] = "ReSukiSU-KERNEL-ABI-35079";' "$CORE_INIT"
+        fi
+        grep -q 'ReSukiSU-KERNEL-ABI-35079' "$CORE_INIT"
+
+        # Injeksi ksu_cred secara presisi
+        echo "🔧 Injecting extern ksu_cred declaration safely into KernelSU C files..."
+        find drivers/kernelsu/ -type f -name "*.c" | while read -r file; do
+          if grep -q "ksu_cred" "$file" && ! grep -q "struct cred \*ksu_cred" "$file" && ! grep -q "extern.*ksu_cred" "$file"; then
+            echo "  -> Injecting ksu_cred declaration into $file"
+            sed -i '1istruct cred;\nextern struct cred *ksu_cred;' "$file"
+          fi
+        done
+
+        # Fix spesifik untuk selinux_hide.c
+        SELINUX_HIDE_FILE="drivers/kernelsu/feature/selinux_hide.c"
+        if [ -f "$SELINUX_HIDE_FILE" ]; then
+          echo "🔧 Patching missing SELinux identifiers in $SELINUX_HIDE_FILE..."
+          sed -i '1i#include <linux/types.h>\nstruct policydb;\nstruct sidtab;\nextern struct policydb *backup_policydb;\nextern struct sidtab *backup_sidtab;\nextern bool ksu_late_loaded;' "$SELINUX_HIDE_FILE"
+
+          if ! grep -q "^struct policydb \*backup_policydb" "$SELINUX_HIDE_FILE" && ! grep -rq "struct policydb \*backup_policydb" drivers/kernelsu/selinux/ 2>/dev/null; then
+            echo "struct policydb *backup_policydb = NULL;" >> "$SELINUX_HIDE_FILE"
+            echo "struct sidtab *backup_sidtab = NULL;" >> "$SELINUX_HIDE_FILE"
+          fi
+
+          if ! grep -rq "ksu_late_loaded" drivers/kernelsu/core/ 2>/dev/null; then
+            echo "bool ksu_late_loaded = false;" >> "$SELINUX_HIDE_FILE"
+          fi
+        fi
+
+        # Fix spesifik untuk ksud_integration.c
+        KSUD_FILE="drivers/kernelsu/runtime/ksud_integration.c"
+        if [ -f "$KSUD_FILE" ]; then
+          echo "🔧 Patching missing runtime identifiers in $KSUD_FILE..."
+          # Recovery only stages ksud. Install must run inside Android's
+          # post-fs-data SELinux context, after /data and policy are ready.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/add_ksud_install_rc.py" "$KSUD_FILE"
+          grep -Fq '/data/adb/ksu-bootstrap/ksud' "$KSUD_FILE" || {
+            echo "::error::ksud bootstrap executable path missing"; exit 1;
+          }
+          grep -Fq 'install --libadbroot /data/adb/ksu-bootstrap/libadbroot.so' "$KSUD_FILE" || {
+            echo "::error::ksud install argument missing"; exit 1;
+          }
+          grep -Fq '/data/adb/ksu-bootstrap/bootstrap-meta.sh' "$KSUD_FILE" || {
+            echo "::error::metamodule bootstrap command missing"; exit 1;
+          }
+          echo "✅ ksud and metamodule install are scheduled in Android post-fs-data"
+
+          sed -i '1i#include <linux/types.h>\nextern bool ksu_no_custom_rc;\nextern bool ksu_late_loaded;' "$KSUD_FILE"
+
+          if ! grep -rq "bool ksu_no_custom_rc" drivers/kernelsu/ 2>/dev/null; then
+            echo "bool ksu_no_custom_rc = false;" >> "$KSUD_FILE"
+          fi
+          if ! grep -rq "bool ksu_late_loaded" drivers/kernelsu/ 2>/dev/null; then
+            echo "bool ksu_late_loaded = false;" >> "$KSUD_FILE"
+          fi
+        fi
+
+        # Fix spesifik untuk supercall/supercall.c (SUSFS_MAGIC)
+        SUPERCALL_FILE="drivers/kernelsu/supercall/supercall.c"
+        if [ -f "$SUPERCALL_FILE" ]; then
+          echo "🔧 Direct patching SUSFS_MAGIC into $SUPERCALL_FILE..."
+          sed -i '1i#include <linux/types.h>\n#include <linux/susfs_def.h>\n#ifndef SUSFS_MAGIC\n#define SUSFS_MAGIC 0xA5A5A5A5\n#endif' "$SUPERCALL_FILE"
+        fi
+
+        # Keep the ABI marker, but never duplicate SUSFS command IDs here.
+        # The post-setup SUSFS 2.2.0 tree is the single source of truth for
+        # SUSFS_MAGIC, CMD_SUSFS_* and inode-state definitions. A shadow header
+        # under drivers/kernelsu/include/linux can silently win by include order.
+        DISPATCH_FILE="drivers/kernelsu/supercall/dispatch.c"
+        if [ -f "$DISPATCH_FILE" ]; then
+          echo "🔒 Using the canonical SUSFS 2.2.0 command ABI..."
+          sed -i '1i__attribute__((used, section(".rodata"))) static const unsigned int resukisu_kernel_abi_version = 35079;\n#include <linux/types.h>\n#include <linux/susfs_def.h>\n#ifndef KERNEL_SU_VERSION\n#define KERNEL_SU_VERSION 35079\n#endif\nextern bool ksu_late_loaded;' "$DISPATCH_FILE"
+        fi
+        rm -f drivers/kernelsu/include/linux/susfs_def.h
+
+        # Keep KernelSU_temp: drivers/kernelsu is a symlink into this clone so
+        # upstream Git/version and fail-closed Kbuild checks remain valid.
+        test -e KernelSU_temp/.git
+        test -f drivers/kernelsu/Kbuild
+
+        sed -i 's|source "KernelSU/Kconfig"|source "drivers/kernelsu/Kconfig"|g' drivers/Kconfig
+        sed -i 's|source "drivers/KernelSU/Kconfig"|source "drivers/kernelsu/Kconfig"|g' drivers/Kconfig
+
+        if ! grep -q "drivers/kernelsu/Kconfig" drivers/Kconfig; then
+          sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig || echo 'source "drivers/kernelsu/Kconfig"' >> drivers/Kconfig
+        fi
+
+        if ! grep -q "kernelsu" drivers/Makefile; then
+          echo 'obj-y += kernelsu/' >> drivers/Makefile
+        fi
+
+        echo "🔒 Preserving upstream fail-closed Kbuild validators..."
+        ! grep -R -nF '$(info You should integrate' drivers/kernelsu/tools drivers/kernelsu/Kbuild 2>/dev/null || {
+          echo "::error::KernelSU validators were weakened"; exit 1;
+        }
+        grep -qF '$(error You should integrate' drivers/kernelsu/tools/inline_hook_check.mk || {
+          echo "::error::inline hook validator is not fail-closed"; exit 1;
+        }
+
+        echo "✅ Verification of drivers/kernelsu directory:"
+        ls -la drivers/kernelsu/
+        

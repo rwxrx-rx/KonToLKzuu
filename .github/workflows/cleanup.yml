@@ -1,0 +1,80 @@
+name: Cleanup Workflow Runs
+
+on:
+  # 1. Otomatis berjalan sesuai jadwal (Cron)
+  # Contoh di bawah: Berjalan otomatis setiap hari Minggu pukul 00:00 UTC
+  schedule:
+    - cron: '0 0 * * 0'
+
+  # 2. (Opsional) Otomatis berjalan setiap kali workflow build kernel selesai
+  # Hapus bagian workflow_run ini jika kamu HANYA ingin jadwal berkala (cron)
+  workflow_run:
+    workflows: ["Build Kernel & Manager Worker"]
+    types:
+      - completed
+
+  # 3. Tetap bisa dijalankan secara manual via UI Actions
+  workflow_dispatch:
+    inputs:
+      del_type:
+        description: 'Pilih jenis pembersihan:'
+        required: true
+        type: choice
+        default: 'failed_only'
+        options:
+          - 'failed_only'
+          - 'all_runs'
+          - 'cleanup_runs_only'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Delete Workflow Runs via GitHub CLI
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Ambil pilihan dari input manual, jika kosong (berjalan otomatis) gunakan 'failed_only'
+          DEL_TYPE="${{ inputs.del_type }}"
+          if [ -z "$DEL_TYPE" ]; then
+            DEL_TYPE="failed_only"
+            echo "Workflow dipicu secara otomatis. Menggunakan mode default: $DEL_TYPE"
+          fi
+
+          REPO="${{ github.repository }}"
+          CURRENT_RUN_ID="${{ github.run_id }}"
+
+          echo "Memulai proses pembersihan dengan opsi: $DEL_TYPE"
+
+          if [ "$DEL_TYPE" = "failed_only" ]; then
+            echo "Menghapus riwayat workflow yang GAGAL / DIBATALKAN (hanya yang sudah selesai)..."
+            RUN_IDS=$(gh run list --repo "$REPO" --limit 1000 --json databaseId,status,conclusion --jq ".[] | select(.status == \"completed\" and (.conclusion != \"success\" and .conclusion != \"\") and (.databaseId | tostring) != \"$CURRENT_RUN_ID\") | .databaseId")
+
+          elif [ "$DEL_TYPE" = "all_runs" ]; then
+            echo "Menghapus SEMUA riwayat workflow (hanya yang sudah selesai)..."
+            RUN_IDS=$(gh run list --repo "$REPO" --limit 1000 --json databaseId,status --jq ".[] | select(.status == \"completed\" and (.databaseId | tostring) != \"$CURRENT_RUN_ID\") | .databaseId")
+
+          elif [ "$DEL_TYPE" = "cleanup_runs_only" ]; then
+            echo "Menghapus riwayat workflow Cleanup yang sudah selesai..."
+            RUN_IDS=$(gh run list --repo "$REPO" --workflow "Cleanup Workflow Runs" --limit 1000 --json databaseId,status --jq ".[] | select(.status == \"completed\" and (.databaseId | tostring) != \"$CURRENT_RUN_ID\") | .databaseId")
+          fi
+
+          if [ -z "$RUN_IDS" ]; then
+            echo "Tidak ada riwayat workflow yang perlu dihapus."
+            exit 0
+          fi
+
+          echo "Menghapus workflow run secara aman..."
+          for RUN_ID in $RUN_IDS; do
+            echo "Menghapus Run ID: $RUN_ID"
+            gh run delete "$RUN_ID" --repo "$REPO" || echo "Gagal menghapus Run ID: $RUN_ID, mengabaikan..."
+          done
+
+          echo "Pembersihan selesai!"

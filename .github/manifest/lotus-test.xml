@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <remote name="github" fetch="https://github.com" />
+  <project path="kernel-source" name="rwxrx-rx/kernel_xiaomi_mt6833" remote="github" revision="lotus-test" />
+</manifest>
